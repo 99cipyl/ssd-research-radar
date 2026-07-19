@@ -1398,6 +1398,51 @@ def opml_xml(
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode")
 
 
+def opml_import_html(archive_count: int, *, base_url: Optional[str] = None) -> str:
+    """Human-friendly, same-origin download page for browsers and iOS Files."""
+
+    base = normalize_public_base_url(base_url)
+    opml_url = html.escape(public_site_url("netnewswire.opml", base), quote=True)
+    live_url = html.escape(public_site_url("live.xml", base), quote=True)
+    return f"""<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>导入 SSD Research Radar 到 NetNewsWire</title>
+  <style>
+    :root {{ color-scheme: light; font-family: -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
+    body {{ margin:0; background:#f3f5ef; color:#102c25; }}
+    main {{ width:min(680px,calc(100% - 36px)); margin:8vh auto; padding:clamp(24px,6vw,52px); box-sizing:border-box; background:#fff; border:1px solid #cad8d1; border-radius:20px; box-shadow:0 18px 60px rgba(16,44,37,.1); }}
+    .eyebrow {{ color:#35745f; font-size:12px; font-weight:750; letter-spacing:.12em; }}
+    h1 {{ margin:14px 0; font-size:clamp(30px,7vw,48px); line-height:1.08; letter-spacing:-.035em; }}
+    p,li {{ line-height:1.7; }}
+    .button {{ display:block; margin:28px 0 16px; padding:17px 20px; border-radius:12px; color:#fff; background:#11634d; font-weight:750; text-align:center; text-decoration:none; }}
+    .secondary {{ display:block; color:#11634d; text-align:center; font-weight:650; }}
+    ol {{ padding-left:24px; }}
+    aside {{ margin-top:26px; padding:16px 18px; background:#eff6f2; border-radius:12px; font-size:14px; }}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="eyebrow">NETNEWSWIRE · OPML</div>
+    <h1>下载后导入，不需要阅读 XML</h1>
+    <p>OPML 是订阅清单，不是普通网页。它包含一个实时更新 Feed 和 {archive_count} 个历史归档 Feed。</p>
+    <a class="button" href="{opml_url}" download="SSD-Research-Radar.opml">下载 UTF-8 OPML 文件</a>
+    <a class="secondary" href="{live_url}">只订阅后续更新 →</a>
+    <ol>
+      <li>在 iPhone 或 iPad 上把下载文件存入“文件”App。</li>
+      <li>打开 NetNewsWire：Settings → Import Subscriptions。</li>
+      <li>选择刚下载的 <strong>SSD-Research-Radar.opml</strong>。</li>
+      <li>只给“SSD 即时更新”文件夹开启通知；历史归档保持关闭。</li>
+    </ol>
+    <aside>如果浏览器仍显示 XML，长按“下载”按钮并选择“下载链接文件”；XML 页面本身不是报错。</aside>
+  </main>
+</body>
+</html>
+"""
+
+
 def live_event_rows(conn: sqlite3.Connection) -> List[sqlite3.Row]:
     pending = conn.execute(
         """
@@ -1442,7 +1487,10 @@ def write_mobile_feeds(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) ->
     for stale in SITE_DIR.glob("archive-*.xml"):
         if stale.name not in expected:
             stale.unlink()
-    atomically_write(SITE_DIR / "netnewswire.opml", opml_xml(archive_specs, base_url=base))
+    # GitHub Pages serves .opml as text/x-opml without a charset. A UTF-8 BOM
+    # prevents Chromium from guessing Windows-1252 and displaying mojibake.
+    atomically_write(SITE_DIR / "netnewswire.opml", "\ufeff" + opml_xml(archive_specs, base_url=base))
+    atomically_write(SITE_DIR / "import.html", opml_import_html(len(archive_specs), base_url=base))
 
 
 def build_site(conn: sqlite3.Connection) -> None:

@@ -44,7 +44,7 @@ python3 radar.py serve --open
 
 - 历史面板：`http://127.0.0.1:8765/`
 - 实时 RSS：`http://127.0.0.1:8765/live.xml`
-- NetNewsWire OPML：`http://127.0.0.1:8765/netnewswire.opml`
+- NetNewsWire 导入页：`http://127.0.0.1:8765/import.html`
 
 `127.0.0.1` 只能在这台 Mac 上访问，不能作为手机订阅地址。手机订阅必须使用下面的公网发布方式。
 
@@ -60,7 +60,7 @@ python3 radar.py build
 发布 `site/` 目录后，可以：
 
 - 只订阅即时更新：`https://YOUR_NAME.github.io/ssd-research-radar/live.xml`；
-- 导入 `https://YOUR_NAME.github.io/ssd-research-radar/netnewswire.opml`，一次获得即时 Feed 和所有历史分卷；
+- 打开 `https://YOUR_NAME.github.io/ssd-research-radar/import.html` 下载并导入 OPML，一次获得即时 Feed 和所有历史分卷；
 - `feed.xml` 是与 `live.xml` 字节完全相同的兼容别名，旧订阅无需迁移。
 
 `live.xml` 最多保留最近 350 个“首次基线以后新增或实质更新”的事件。首次建库导入的旧资料不会进入 Live，也不会制造几千条未读通知。全部资料会按年份生成 `archive-YYYY.xml`；某一年超过 350 条时继续生成 `archive-YYYY-2.xml`、`archive-YYYY-3.xml`。每个分卷不超过 350 条，全部公网地址都写入 `netnewswire.opml`。
@@ -123,7 +123,8 @@ python3 radar.py build
 - 手机实时 RSS：`site/live.xml`
 - 兼容 RSS：`site/feed.xml`
 - 历史分卷 RSS：`site/archive-*.xml`（每卷最多 350 条）
-- NetNewsWire 导入清单：`site/netnewswire.opml`
+- NetNewsWire 浏览器导入页：`site/import.html`
+- NetNewsWire 导入清单：`site/netnewswire.opml`（UTF-8 BOM，兼容缺少 charset 的静态托管响应）
 
 RSS 是首次基线后的“新增与实质更新事件流”，完整旧资料仍在历史面板和 `archive.json` 中。资料后续发生变化时，旧快照保存在 SQLite 的 `item_versions` 表，不会被新内容无痕覆盖。
 

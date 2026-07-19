@@ -451,10 +451,16 @@ class RadarUnitTests(unittest.TestCase):
                 for path in archive_files
             ]
             self.assertEqual(sorted(archive_counts), [2, 350])
+            opml_bytes = (site / "netnewswire.opml").read_bytes()
+            self.assertTrue(opml_bytes.startswith(b"\xef\xbb\xbf<?xml"))
             opml = ET.parse(site / "netnewswire.opml").getroot()
             urls = [node.attrib["xmlUrl"] for node in opml.iter("outline") if "xmlUrl" in node.attrib]
             self.assertEqual(urls[0], "https://reader.example/ssd-radar/live.xml")
             self.assertIn("https://reader.example/ssd-radar/archive-2026.xml", urls)
+            import_page = (site / "import.html").read_text(encoding="utf-8")
+            self.assertIn('<meta charset="utf-8">', import_page)
+            self.assertIn('download="SSD-Research-Radar.opml"', import_page)
+            self.assertIn("https://reader.example/ssd-radar/netnewswire.opml", import_page)
         conn.close()
 
     def test_websub_failure_keeps_event_pending_then_success_acknowledges(self):

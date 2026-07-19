@@ -243,10 +243,10 @@ def inject_subscription_links(index_path: Path, base_url: str) -> None:
         text = text.replace("</head>", alternate + "\n</head>", 1)
     banner = (
         '<p><a href="full.xml" style="color:#fff;font-weight:700">订阅完整历史 + 后续更新 RSS</a>'
-        '　·　<a href="subscriptions.opml" style="color:#d8ebe2">下载 NetNewsWire OPML</a></p>'
+        '　·　<a href="import.html" style="color:#d8ebe2">导入 NetNewsWire OPML</a></p>'
     )
     marker = "</header>"
-    if "subscriptions.opml" not in text:
+    if "import.html" not in text:
         text = text.replace(marker, banner + marker, 1)
     index_path.write_text(text, encoding="utf-8")
 
