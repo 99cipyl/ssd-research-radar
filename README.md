@@ -11,6 +11,7 @@
 ## 已接入来源
 
 - DBLP 的 USENIX FAST 全部可检索论文；
+- NVMW 官方主页与年度 Program 变化；
 - ETH SAFARI 网站公开的全部 WordPress 文章；
 - NVM Express 网站公开的全部 WordPress 文章、技术资源和规范页变化；
 - OCP Storage 公开 RSS；

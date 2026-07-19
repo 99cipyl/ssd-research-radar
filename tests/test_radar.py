@@ -12,6 +12,36 @@ import radar
 
 
 class RadarUnitTests(unittest.TestCase):
+    @staticmethod
+    def dblp_fixture_responses():
+        index = b"""<bht>
+        <dblpcites><r><proceedings key='conf/fast/2024'><year>2024</year>
+          <url>db/conf/fast/fast2024.html</url></proceedings></r></dblpcites>
+        <dblpcites><r><proceedings key='conf/fast/2026'><year>2026</year>
+          <url>db/conf/fast/fast2026.html</url></proceedings></r></dblpcites>
+        <dblpcites><r><proceedings key='conf/fast/2025'><year>2025</year>
+          <url>db/conf/fast/fast2025.html</url></proceedings></r></dblpcites>
+        <dblpcites><r><proceedings key='conf/fast/2010sustainit'><year>2010</year>
+          <url>db/conf/fast/sustainit2010.html</url></proceedings></r></dblpcites>
+        </bht>"""
+
+        def toc(year, key, title):
+            return f"""<bht><dblpcites><r><inproceedings key='{key}' mdate='{year}-07-01'>
+              <author pid='1'>Ada Lovelace</author><author pid='2'>Alan Turing</author>
+              <title>{title}</title><year>{year}</year><booktitle>FAST</booktitle>
+              <ee type='oa'>https://www.usenix.org/fast/{year}/{key.rsplit('/', 1)[-1]}</ee>
+              <ee>https://doi.org/10.1234/{year}</ee>
+              <crossref>conf/fast/{year}</crossref>
+              <url>db/conf/fast/fast{year}.html#paper</url>
+            </inproceedings></r></dblpcites></bht>""".encode()
+
+        return {
+            "/db/conf/fast/index.xml": index,
+            "/db/conf/fast/fast2026.xml": toc(2026, "conf/fast/Test26", "SSD <i>Everywhere</i>."),
+            "/db/conf/fast/fast2025.xml": toc(2025, "conf/fast/Test25", "Reliable NAND."),
+            "/db/conf/fast/fast2024.xml": toc(2024, "conf/fast/Test24", "Storage Systems."),
+        }
+
     def test_normalization(self):
         self.assertEqual(radar.normalize_title("  Flash-Translation Layer™  "), "flash translation layertm")
         self.assertEqual(
@@ -41,6 +71,93 @@ class RadarUnitTests(unittest.TestCase):
         source = {"id": "x", "name": "X"}
         with self.assertRaises(ValueError):
             radar.parse_feed(b"<!DOCTYPE x [<!ENTITY y 'z'>]><rss/>", source)
+
+    def test_dblp_incremental_uses_latest_two_tocs_and_mirror_fallback(self):
+        responses = self.dblp_fixture_responses()
+        calls = []
+
+        def fake_request(url, *_args, **_kwargs):
+            calls.append(url)
+            parsed = radar.urllib.parse.urlsplit(url)
+            if parsed.netloc == "dblp.org":
+                raise radar.urllib.error.URLError("remote disconnected")
+            return responses[parsed.path], {}
+
+        source = {
+            "endpoint": "https://dblp.org/db/conf/fast/index.xml",
+            "mirrors": ["https://dblp.org/", "https://dblp.dagstuhl.de/", "https://dblp.uni-trier.de/"],
+        }
+        with mock.patch.object(radar, "request_bytes", side_effect=fake_request), mock.patch.object(
+            radar.time, "sleep"
+        ) as sleep:
+            rows = radar.fetch_dblp(source, False, None)
+
+        self.assertEqual([row["external_id"] for row in rows], ["conf/fast/Test26", "conf/fast/Test25"])
+        self.assertEqual(rows[0]["title"], "SSD Everywhere.")
+        self.assertEqual(rows[0]["authors"], "Ada Lovelace, Alan Turing")
+        self.assertEqual(rows[0]["venue"], "FAST")
+        self.assertEqual(rows[0]["published_at"], "2026-01-01T00:00:00Z")
+        self.assertEqual(rows[0]["doi"], "https://doi.org/10.1234/2026")
+        self.assertTrue(any(url.startswith("https://dblp.dagstuhl.de/") for url in calls))
+        self.assertEqual(sum(url.startswith("https://dblp.org/") for url in calls), 1)
+        self.assertFalse(any("fast2024.xml" in url for url in calls))
+        sleep.assert_has_calls([mock.call(1.1), mock.call(1.1)])
+
+    def test_dblp_full_fetches_all_main_tocs_but_not_workshops(self):
+        responses = self.dblp_fixture_responses()
+        paths = []
+
+        def fake_request(url, *_args, **_kwargs):
+            path = radar.urllib.parse.urlsplit(url).path
+            paths.append(path)
+            return responses[path], {}
+
+        source = {
+            "endpoint": "https://dblp.org/db/conf/fast/index.xml",
+            "mirrors": ["https://dblp.org/"],
+        }
+        with mock.patch.object(radar, "request_bytes", side_effect=fake_request), mock.patch.object(
+            radar.time, "sleep"
+        ):
+            rows = radar.fetch_dblp(source, True, "2000-01-01")
+
+        self.assertEqual(len(rows), 3)
+        self.assertIn("/db/conf/fast/fast2024.xml", paths)
+        self.assertNotIn("/db/conf/fast/sustainit2010.xml", paths)
+
+    def test_dblp_gets_periodic_full_scan_after_thirty_days(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(radar.SCHEMA)
+        old = radar.iso(radar.utcnow() - radar.dt.timedelta(days=31))
+        conn.execute(
+            """
+            INSERT INTO sources(
+                id,name,kind,category,homepage,endpoint,config_json,initialized,
+                last_success_at,last_full_at
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                "fast_dblp", "FAST", "dblp", "system", "https://dblp.org/",
+                "https://dblp.org/db/conf/fast/index.xml", "{}", 1, old, old,
+            ),
+        )
+        run_id = conn.execute("INSERT INTO runs(started_at,status) VALUES('now','running')").lastrowid
+        full_values = []
+
+        def fake_fetch(_source, full, _since):
+            full_values.append(full)
+            return []
+
+        source = {
+            "id": "fast_dblp", "name": "FAST", "kind": "dblp", "category": "system",
+            "homepage": "https://dblp.org/", "endpoint": "https://dblp.org/db/conf/fast/index.xml",
+        }
+        with mock.patch.dict(radar.FETCHERS, {"dblp": fake_fetch}):
+            radar.sync_source(conn, run_id, source, False)
+        self.assertEqual(full_values, [True])
+        self.assertGreater(conn.execute("SELECT last_full_at FROM sources").fetchone()[0], old)
+        conn.close()
 
     def test_doi_dedupes_across_sources(self):
         conn = sqlite3.connect(":memory:")
@@ -204,6 +321,7 @@ class RadarUnitTests(unittest.TestCase):
             site = Path(directory)
             self.assertEqual((site / "live.xml").read_bytes(), (site / "feed.xml").read_bytes())
             live_root = ET.parse(site / "live.xml").getroot()
+            self.assertEqual(live_root.findtext("channel/ttl"), "15")
             live_items = [node for node in live_root.iter() if radar.xml_local_name(node.tag) == "item"]
             self.assertEqual([node.findtext("title") for node in live_items], ["Future live item"])
             atom = {"atom": "http://www.w3.org/2005/Atom"}

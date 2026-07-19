@@ -8,8 +8,25 @@
       "kind": "dblp",
       "category": "系统 / FTL",
       "homepage": "https://dblp.org/db/conf/fast/",
-      "endpoint": "https://dblp.org/search/publ/api",
-      "query": "streamid:conf/fast:",
+      "endpoint": "https://dblp.org/db/conf/fast/index.xml",
+      "mirrors": [
+        "https://dblp.org/",
+        "https://dblp.dagstuhl.de/",
+        "https://dblp.uni-trier.de/"
+      ],
+      "minimum_interval_hours": 12,
+      "enabled": true
+    },
+    {
+      "id": "nvmw_official",
+      "name": "NVMW Official",
+      "kind": "page",
+      "category": "NVMW / 前沿会议",
+      "homepage": "https://nvmw.ucsd.edu/",
+      "endpoint": "https://nvmw.ucsd.edu/",
+      "title": "NVMW Official Program & Announcements",
+      "authors": "Non-Volatile Memories Workshop",
+      "minimum_interval_hours": 6,
       "enabled": true
     },
     {

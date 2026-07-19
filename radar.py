@@ -281,7 +281,10 @@ def canonical_key(record: Dict[str, Any], source_id: str) -> str:
 
 def notification_relevant(source_id: str, title: str, summary: str, item_type: str) -> bool:
     text = f" {title} {summary} ".casefold()
-    if source_id in {"fast_dblp", "openalex_ssd", "nvm_express_resources", "nvm_express_specs", "nvm_express_spec_archives"}:
+    if source_id in {
+        "fast_dblp", "openalex_ssd", "nvmw_official", "nvm_express_resources",
+        "nvm_express_specs", "nvm_express_spec_archives",
+    }:
         return True
     if source_id == "safari_eth":
         return any(term in text for term in (
@@ -373,7 +376,12 @@ def register_sources(conn: sqlite3.Connection, config: Dict[str, Any]) -> None:
     conn.commit()
 
 
-def request_bytes(url: str, headers: Optional[Dict[str, str]] = None, retries: int = 3) -> Tuple[bytes, Any]:
+def request_bytes(
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+    retries: int = 3,
+    timeout: int = 45,
+) -> Tuple[bytes, Any]:
     request_headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     if headers:
         request_headers.update(headers)
@@ -381,7 +389,7 @@ def request_bytes(url: str, headers: Optional[Dict[str, str]] = None, retries: i
     for attempt in range(retries):
         try:
             request = urllib.request.Request(url, headers=request_headers)
-            with urllib.request.urlopen(request, timeout=45) as response:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 length = response.headers.get("Content-Length")
                 if length and int(length) > MAX_RESPONSE_BYTES:
                     raise ValueError(f"response too large: {length} bytes")
@@ -438,47 +446,118 @@ def author_names(value: Any) -> str:
     return ", ".join(names)
 
 
-def fetch_dblp(source: Dict[str, Any], _full: bool, _since: Optional[str]) -> List[Dict[str, Any]]:
+DBLP_MIRRORS: Sequence[str] = (
+    "https://dblp.org/",
+    "https://dblp.dagstuhl.de/",
+    "https://dblp.uni-trier.de/",
+)
+
+
+def request_dblp_xml(source: Dict[str, Any], path: str) -> ET.Element:
+    """Fetch one static dblp XML page, failing over across official mirrors."""
+    configured = source.get("mirrors") or DBLP_MIRRORS
+    if isinstance(configured, str):
+        configured = [configured]
+    mirrors = [str(value).rstrip("/") + "/" for value in configured]
+    preferred = source.get("_dblp_preferred_mirror")
+    if preferred in mirrors:
+        # Once a mirror works, keep it first for the rest of this sync.  This
+        # prevents a full import from paying the timeout cost again per TOC.
+        mirrors.remove(preferred)
+        mirrors.insert(0, preferred)
+    failures: List[str] = []
+    for mirror in mirrors:
+        url = urllib.parse.urljoin(mirror, path.lstrip("/"))
+        try:
+            data, _ = request_bytes(
+                url,
+                {"Accept": "application/xml, text/xml;q=0.9"},
+                retries=1,
+                timeout=15,
+            )
+            root = ET.fromstring(data)
+            source["_dblp_preferred_mirror"] = mirror
+            return root
+        except urllib.error.HTTPError as exc:
+            # A rate limit is an instruction to pause, not a reason to evade it
+            # by immediately switching to another official mirror.
+            if exc.code == 429:
+                raise
+            failures.append(f"{urllib.parse.urlsplit(url).netloc}: HTTP {exc.code}")
+        except (urllib.error.URLError, TimeoutError, ConnectionError, ET.ParseError) as exc:
+            failures.append(f"{urllib.parse.urlsplit(url).netloc}: {type(exc).__name__}")
+    raise RuntimeError(f"all official dblp mirrors failed for {path}: {'; '.join(failures)}")
+
+
+def element_text(element: Optional[ET.Element]) -> str:
+    if element is None:
+        return ""
+    return strip_html(" ".join("".join(element.itertext()).split()))
+
+
+def fetch_dblp(source: Dict[str, Any], full: bool, _since: Optional[str]) -> List[Dict[str, Any]]:
+    source = dict(source)
+    endpoint_path = urllib.parse.urlsplit(source["endpoint"]).path or "/db/conf/fast/index.xml"
+    index = request_dblp_xml(source, endpoint_path)
+    toc_specs: List[Tuple[int, str, str]] = []
+    for proceedings in index.iter("proceedings"):
+        volume_key = proceedings.attrib.get("key", "")
+        if not re.fullmatch(r"conf/fast/\d{4}", volume_key):
+            continue
+        year_text = element_text(proceedings.find("year")) or volume_key.rsplit("/", 1)[-1]
+        toc_url = element_text(proceedings.find("url"))
+        if not toc_url or not year_text.isdigit():
+            continue
+        toc_path = urllib.parse.urlsplit(toc_url).path
+        toc_path = re.sub(r"\.html$", ".xml", toc_path)
+        toc_specs.append((int(year_text), volume_key, toc_path))
+
+    toc_specs.sort(reverse=True)
+    if not full:
+        # FAST is annual.  Re-reading the current and previous proceedings is
+        # enough for prompt additions/corrections; a periodic full scan below
+        # catches edits to older volumes.
+        toc_specs = toc_specs[:2]
+
     records: List[Dict[str, Any]] = []
-    offset = 0
-    while True:
-        # Smaller pages are more reliable than a single large DBLP response on
-        # slow or filtered corporate networks.
-        params = {"q": source["query"], "h": 100, "f": offset, "format": "json"}
-        payload, _ = request_json(f"{source['endpoint']}?{urllib.parse.urlencode(params)}")
-        hits_block = payload.get("result", {}).get("hits", {})
-        hits = hits_block.get("hit", []) or []
-        if isinstance(hits, dict):
-            hits = [hits]
-        for hit in hits:
-            info = hit.get("info", {})
-            if info.get("type") != "Conference and Workshop Papers" or info.get("venue") != "FAST":
+    for _year, volume_key, toc_path in toc_specs:
+        # dblp explicitly asks automated clients to leave 1-2 seconds between
+        # requests.  This also makes the one-time full import less bursty.
+        time.sleep(1.1)
+        toc = request_dblp_xml(source, toc_path)
+        for publication in toc.iter("inproceedings"):
+            if element_text(publication.find("crossref")) != volume_key:
                 continue
-            title = strip_html(info.get("title"))
+            publication_key = publication.attrib.get("key", "")
+            title = element_text(publication.find("title"))
             if not title:
                 continue
-            authors = info.get("authors", {}).get("author", []) if isinstance(info.get("authors"), dict) else []
-            electronic = info.get("ee")
-            if isinstance(electronic, list):
-                electronic = electronic[0] if electronic else None
+            authors = [element_text(node) for node in publication.findall("author")]
+            electronic = [element_text(node) for node in publication.findall("ee")]
+            electronic = [value for value in electronic if value]
+            doi = next((value for value in electronic if "doi.org/" in value.casefold()), None)
+            year = element_text(publication.find("year"))
             record = {
-                "external_id": info.get("key") or info.get("url") or title,
+                "external_id": publication_key or title,
                 "item_type": "paper",
                 "title": title,
-                "url": electronic or info.get("url"),
-                "doi": info.get("doi"),
+                "url": electronic[0] if electronic else f"https://dblp.org/rec/{publication_key}",
+                "doi": doi,
                 "authors": author_names(authors),
-                "venue": strip_html(info.get("venue") or "USENIX FAST"),
-                "published_at": parse_datetime(str(info.get("year") or "")),
+                "venue": element_text(publication.find("booktitle")) or "USENIX FAST",
+                "published_at": parse_datetime(year),
                 "summary": "",
-                "raw": info,
+                "raw": {
+                    "key": publication_key,
+                    "mdate": publication.attrib.get("mdate"),
+                    "authors": authors,
+                    "title": title,
+                    "year": year,
+                    "booktitle": element_text(publication.find("booktitle")),
+                    "ee": electronic,
+                },
             }
             records.append(record)
-        total = int(hits_block.get("@total", len(records)))
-        offset += len(hits)
-        if not hits or offset >= total:
-            break
-        time.sleep(1.0)
     return records
 
 
@@ -495,7 +574,7 @@ def fetch_page(source: Dict[str, Any], _full: bool, _since: Optional[str]) -> Li
         "title": source.get("title") or "Page update",
         "url": source["endpoint"],
         "doi": None,
-        "authors": "NVM Express",
+        "authors": source.get("authors") or source["name"],
         "venue": source["name"],
         "published_at": None,
         "summary": summary,
@@ -935,7 +1014,7 @@ def sync_source(conn: sqlite3.Connection, run_id: int, source: Dict[str, Any], f
     row = conn.execute("SELECT * FROM sources WHERE id=?", (source["id"],)).fetchone()
     initialized = bool(row["initialized"])
     periodic_full = False
-    if source["kind"] == "openalex" and initialized:
+    if source["kind"] in {"openalex", "dblp"} and initialized:
         last_full = parse_datetime(row["last_full_at"])
         if not last_full:
             periodic_full = True
@@ -1151,6 +1230,10 @@ def rss_xml(
         else "SSD / NAND / NVMe 新增与实质更新"
     )
     ET.SubElement(channel, "language").text = "zh-CN"
+    if not archive:
+        # RSS ttl is advisory (minutes), but readers that honor it can poll the
+        # live feed at the same cadence as the cloud updater.
+        ET.SubElement(channel, "ttl").text = "15"
     ET.SubElement(channel, "lastBuildDate").text = email.utils.format_datetime(utcnow())
     ET.SubElement(channel, f"{{{atom_namespace}}}link", {
         "href": self_url, "rel": "self", "type": "application/rss+xml",
