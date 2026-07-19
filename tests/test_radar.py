@@ -72,6 +72,42 @@ class RadarUnitTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             radar.parse_feed(b"<!DOCTYPE x [<!ENTITY y 'z'>]><rss/>", source)
 
+    def test_page_fetch_follows_configured_same_site_program_link(self):
+        homepage = b"""<html><main>NVMW announcements</main>
+        <a href='/program-3/'>Program (2026)</a>
+        <a href='https://example.com/program'>External program</a></html>"""
+        program = b"<html><main><h1>PROGRAM</h1><h3>Session 3: SSD</h3></main></html>"
+        calls = []
+
+        def fake_request(url, *_args, **_kwargs):
+            calls.append(url)
+            if url == "https://nvmw.ucsd.edu/":
+                return homepage, {}
+            if url == "https://nvmw.ucsd.edu/program-3":
+                return program, {}
+            raise AssertionError(f"unexpected URL: {url}")
+
+        source = {
+            "id": "nvmw_official",
+            "name": "NVMW Official",
+            "endpoint": "https://nvmw.ucsd.edu/",
+            "follow_link_patterns": ["program"],
+            "max_followed_pages": 2,
+        }
+        with mock.patch.object(radar, "request_bytes", side_effect=fake_request):
+            rows = radar.fetch_page(source, False, None)
+
+        self.assertEqual(calls, ["https://nvmw.ucsd.edu/", "https://nvmw.ucsd.edu/program-3"])
+        self.assertIn("NVMW announcements", rows[0]["summary"])
+        self.assertIn("Session 3: SSD", rows[0]["summary"])
+        self.assertEqual(
+            set(rows[0]["raw"]["pages"]),
+            {"https://nvmw.ucsd.edu/", "https://nvmw.ucsd.edu/program-3"},
+        )
+        changed = dict(rows[0])
+        changed["content_fingerprint"] = "changed-linked-page"
+        self.assertNotEqual(radar.content_hash(rows[0]), radar.content_hash(changed))
+
     def test_dblp_incremental_uses_latest_two_tocs_and_mirror_fallback(self):
         responses = self.dblp_fixture_responses()
         calls = []

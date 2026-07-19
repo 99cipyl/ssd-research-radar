@@ -262,7 +262,10 @@ def classify_topics(title: str, summary: str, fallback: Optional[str] = None) ->
 def content_hash(record: Dict[str, Any]) -> str:
     selected = {
         key: record.get(key)
-        for key in ("title", "url", "doi", "authors", "venue", "published_at", "summary")
+        for key in (
+            "title", "url", "doi", "authors", "venue", "published_at", "summary",
+            "content_fingerprint",
+        )
     }
     payload = json.dumps(selected, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -561,13 +564,60 @@ def fetch_dblp(source: Dict[str, Any], full: bool, _since: Optional[str]) -> Lis
     return records
 
 
-def fetch_page(source: Dict[str, Any], _full: bool, _since: Optional[str]) -> List[Dict[str, Any]]:
-    data, _ = request_bytes(source["endpoint"], {"Accept": "text/html,application/xhtml+xml"})
-    text = data.decode("utf-8", "replace")
+def html_main_body(text: str) -> str:
     match = re.search(r"<main\b[^>]*>(.*?)</main>", text, flags=re.I | re.S)
     body = match.group(1) if match else text
     body = re.sub(r"<(script|style|noscript)\b.*?</\1>", " ", body, flags=re.I | re.S)
-    summary = strip_html(body)[:30000]
+    return body
+
+
+def followed_page_urls(source: Dict[str, Any], text: str) -> List[str]:
+    """Discover configured same-site links such as NVMW's current Program page."""
+
+    patterns = [str(value).casefold() for value in source.get("follow_link_patterns", []) if value]
+    if not patterns:
+        return []
+    endpoint = urllib.parse.urlsplit(source["endpoint"])
+    maximum = max(0, min(int(source.get("max_followed_pages", 3)), 10))
+    discovered: List[str] = []
+    for anchor in re.findall(r"<a\b[^>]*>.*?</a>", text, flags=re.I | re.S):
+        match = re.search(r"\bhref\s*=\s*(['\"])(.*?)\1", anchor, flags=re.I | re.S)
+        if not match:
+            continue
+        href = html.unescape(match.group(2)).strip()
+        label = strip_html(anchor)
+        if not any(pattern in f"{label} {href}".casefold() for pattern in patterns):
+            continue
+        url = normalize_url(urllib.parse.urljoin(source["endpoint"], href))
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.scheme not in {"http", "https"} or parsed.netloc != endpoint.netloc:
+            continue
+        if url == normalize_url(source["endpoint"]) or url in discovered:
+            continue
+        discovered.append(url)
+        if len(discovered) >= maximum:
+            break
+    return discovered
+
+
+def fetch_page(source: Dict[str, Any], _full: bool, _since: Optional[str]) -> List[Dict[str, Any]]:
+    data, _ = request_bytes(source["endpoint"], {"Accept": "text/html,application/xhtml+xml"})
+    text = data.decode("utf-8", "replace")
+    pages = [(source["endpoint"], text)]
+    for url in followed_page_urls(source, text):
+        linked_data, _ = request_bytes(url, {"Accept": "text/html,application/xhtml+xml"})
+        pages.append((url, linked_data.decode("utf-8", "replace")))
+
+    summaries: List[str] = []
+    page_hashes: Dict[str, str] = {}
+    for url, page_text in pages:
+        body = html_main_body(page_text)
+        page_hashes[url] = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
+        summaries.append(f"{url}\n{strip_html(body)}")
+    summary = "\n\n".join(summaries)[:30000]
+    page_fingerprint = hashlib.sha256(
+        json.dumps(page_hashes, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()
     return [{
         "external_id": source["endpoint"],
         "item_type": "standard",
@@ -578,7 +628,10 @@ def fetch_page(source: Dict[str, Any], _full: bool, _since: Optional[str]) -> Li
         "venue": source["name"],
         "published_at": None,
         "summary": summary,
-        "raw": {"sha256": hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()},
+        # The human-readable summary is bounded, but changes anywhere in a
+        # long linked Program page must still create an update event.
+        "content_fingerprint": page_fingerprint,
+        "raw": {"pages": page_hashes},
     }]
 
 

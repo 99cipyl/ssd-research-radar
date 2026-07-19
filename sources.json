@@ -26,6 +26,10 @@
       "endpoint": "https://nvmw.ucsd.edu/",
       "title": "NVMW Official Program & Announcements",
       "authors": "Non-Volatile Memories Workshop",
+      "follow_link_patterns": [
+        "program"
+      ],
+      "max_followed_pages": 2,
       "minimum_interval_hours": 6,
       "enabled": true
     },
