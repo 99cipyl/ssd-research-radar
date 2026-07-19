@@ -1,0 +1,142 @@
+{
+  "history_start_date": "2000-01-01",
+  "incremental_overlap_days": 365,
+  "sources": [
+    {
+      "id": "fast_dblp",
+      "name": "USENIX FAST（DBLP）",
+      "kind": "dblp",
+      "category": "系统 / FTL",
+      "homepage": "https://dblp.org/db/conf/fast/",
+      "endpoint": "https://dblp.org/search/publ/api",
+      "query": "streamid:conf/fast:",
+      "enabled": true
+    },
+    {
+      "id": "safari_eth",
+      "name": "ETH SAFARI Research Group",
+      "kind": "wordpress",
+      "category": "SAFARI 动态",
+      "homepage": "https://safari.ethz.ch/",
+      "endpoint": "https://safari.ethz.ch/wp-json/wp/v2/posts",
+      "feed": "https://safari.ethz.ch/feed/",
+      "enabled": true
+    },
+    {
+      "id": "nvm_express",
+      "name": "NVM Express",
+      "kind": "wordpress",
+      "category": "NVMe / 标准",
+      "homepage": "https://nvmexpress.org/",
+      "endpoint": "https://nvmexpress.org/wp-json/wp/v2/posts",
+      "feed": "https://nvmexpress.org/feed/",
+      "enabled": true
+    },
+    {
+      "id": "nvm_express_resources",
+      "name": "NVM Express 技术资源",
+      "kind": "wordpress",
+      "category": "NVMe / 标准",
+      "homepage": "https://nvmexpress.org/resource/",
+      "endpoint": "https://nvmexpress.org/wp-json/wp/v2/resource",
+      "enabled": true
+    },
+    {
+      "id": "nvm_express_specs",
+      "name": "NVM Express 规范页",
+      "kind": "wordpress_page",
+      "category": "NVMe / 标准",
+      "homepage": "https://nvmexpress.org/specifications/",
+      "endpoint": "https://nvmexpress.org/wp-json/wp/v2/pages/4457",
+      "title": "NVM Express Specifications",
+      "enabled": true
+    },
+    {
+      "id": "nvm_express_spec_archives",
+      "name": "NVM Express 历史规范页",
+      "kind": "wordpress_page",
+      "category": "NVMe / 标准",
+      "homepage": "https://nvmexpress.org/nvm-express-specification-archives/",
+      "endpoint": "https://nvmexpress.org/wp-json/wp/v2/pages/18739",
+      "title": "NVM Express Specification Archives",
+      "enabled": true
+    },
+    {
+      "id": "ocp_storage",
+      "name": "OCP Storage",
+      "kind": "groupsio",
+      "category": "数据中心 / 工程",
+      "homepage": "https://ocp-all.groups.io/g/OCP-Storage",
+      "endpoint": "https://ocp-all.groups.io/g/OCP-Storage/rss",
+      "api_endpoint": "https://groups.io/api/v1/getmessages",
+      "group_id": 23333,
+      "archive_note": "Groups.io 的公开 RSS 仅返回最近 20 条；完整旧档案需在官网浏览或加入邮件组。",
+      "enabled": true
+    },
+    {
+      "id": "openalex_ssd",
+      "name": "SSD 学术主题（OpenAlex）",
+      "kind": "openalex",
+      "category": "跨出版社论文",
+      "homepage": "https://openalex.org/",
+      "endpoint": "https://api.openalex.org/works",
+      "minimum_interval_hours": 20,
+      "enabled": true,
+      "queries": [
+        {
+          "search": "\"flash translation layer\"",
+          "required_any": ["flash translation layer"]
+        },
+        {
+          "search": "\"SSD garbage collection\"",
+          "required_any": ["garbage collection"]
+        },
+        {
+          "search": "\"SSD wear leveling\"",
+          "required_any": ["wear leveling", "wear levelling"]
+        },
+        {
+          "search": "\"NAND flash\" retention",
+          "required_all": ["nand", "flash"],
+          "required_any": ["retention", "data retention"]
+        },
+        {
+          "search": "\"NAND flash\" \"read disturb\"",
+          "required_all": ["nand", "flash"],
+          "required_any": ["read disturb"]
+        },
+        {
+          "search": "\"NAND flash\" \"program disturb\"",
+          "required_all": ["nand", "flash"],
+          "required_any": ["program disturb"]
+        },
+        {
+          "search": "\"NAND flash\" \"read retry\"",
+          "required_all": ["nand", "flash"],
+          "required_any": ["read retry", "read-retry"]
+        },
+        {
+          "search": "\"NAND flash\" scrubbing",
+          "required_all": ["nand", "flash"],
+          "required_any": ["scrubbing", "read reclaim", "background scan", "refresh"]
+        },
+        {
+          "search": "NVMe ZNS",
+          "required_any": ["zns", "zoned namespace", "zoned namespaces"]
+        },
+        {
+          "search": "NVMe FDP",
+          "required_any": ["flexible data placement", "nvme fdp", "fdp ssd"]
+        },
+        {
+          "search": "\"key-value SSD\"",
+          "required_any": ["key-value ssd", "key value ssd", "kv ssd"]
+        },
+        {
+          "search": "\"computational storage device\"",
+          "required_any": ["computational storage", "in-storage computing", "in storage computing"]
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,231 @@
+name: Sync and publish SSD Research Radar
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - radar.py
+      - sources.json
+      - cloud/**
+      - .github/workflows/publish-radar.yml
+  schedule:
+    # Offset from the top of the hour because GitHub reports heavier queueing
+    # there. GitHub schedules are best-effort, not real-time guarantees.
+    - cron: "7,22,37,52 * * * *"
+    # Academic indexes are much slower and do not change minute by minute.
+    - cron: "11 3 * * *"
+    # Explicit full rescan covers delayed academic indexing once a month.
+    - cron: "23 4 1 * *"
+
+concurrency:
+  group: ssd-research-radar-production
+  cancel-in-progress: false
+
+env:
+  PUBLIC_BASE_URL: https://99cipyl.github.io/ssd-research-radar/
+  RADAR_PUBLIC_BASE_URL: https://99cipyl.github.io/ssd-research-radar/
+  RADAR_WEBSUB_HUB: https://pubsubhubbub.appspot.com/
+
+jobs:
+  sync-and-build:
+    permissions:
+      contents: write
+      pages: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    env:
+      OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
+      GROUPS_IO_API_KEY: ${{ secrets.GROUPS_IO_API_KEY }}
+    outputs:
+      sync_exit: ${{ steps.sync.outputs.exit_code }}
+      state_changed: ${{ steps.compare.outputs.changed }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Restore durable state branch
+        id: restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p data
+          if git fetch --depth=1 origin "+refs/heads/radar-state:refs/remotes/origin/radar-state"; then
+            if git cat-file -e "refs/remotes/origin/radar-state:radar.sqlite3"; then
+              git show "refs/remotes/origin/radar-state:radar.sqlite3" > data/radar.sqlite3
+              python3 cloud/state_db.py verify data/radar.sqlite3
+              echo "restored=true" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::radar-state exists but radar.sqlite3 is missing"
+              exit 1
+            fi
+          else
+            echo "No radar-state branch yet; the first run will establish the history baseline."
+            echo "restored=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fingerprint material state before sync
+        id: before
+        shell: bash
+        run: |
+          set -euo pipefail
+          value=$(python3 cloud/state_db.py fingerprint data/radar.sqlite3)
+          echo "value=$value" >> "$GITHUB_OUTPUT"
+          echo "Before: $value"
+
+      - name: Select rate-appropriate source set
+        id: mode
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_SCHEDULE: ${{ github.event.schedule }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == "workflow_dispatch" || "$EVENT_NAME" == "push" ]]; then
+            mode=manual
+            full=false
+          elif [[ "$EVENT_SCHEDULE" == "11 3 * * *" ]]; then
+            mode=academic
+            full=false
+          elif [[ "$EVENT_SCHEDULE" == "23 4 1 * *" ]]; then
+            mode=monthly
+            full=true
+          else
+            mode=frequent
+            full=false
+          fi
+          python3 cloud/prepare_sync.py --mode "$mode"
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+
+      - name: Synchronize sources
+        id: sync
+        shell: bash
+        run: |
+          set +e
+          args=(sync --format json)
+          if [[ "${{ steps.mode.outputs.full }}" == "true" ]]; then
+            args+=(--full)
+          fi
+          python3 radar.py "${args[@]}" > sync-output.json
+          code=$?
+          set -e
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          cat sync-output.json
+          if [[ "$code" -ne 0 && "$code" -ne 2 ]]; then
+            echo "::error::radar.py failed before producing a usable partial result (exit $code)"
+            exit "$code"
+          fi
+          if [[ "$code" -eq 2 ]]; then
+            echo "::warning::One or more sources failed; the partial health state will still be published."
+          fi
+
+      - name: Compare durable material state
+        id: compare
+        shell: bash
+        env:
+          BEFORE: ${{ steps.before.outputs.value }}
+        run: |
+          set -euo pipefail
+          python3 cloud/state_db.py verify data/radar.sqlite3
+          after=$(python3 cloud/state_db.py fingerprint data/radar.sqlite3)
+          echo "After: $after"
+          if [[ "$after" != "$BEFORE" ]]; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "fingerprint=$after" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "fingerprint=$after" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compact and persist changed database state
+        if: steps.compare.outputs.changed == 'true'
+        shell: bash
+        env:
+          EXPECTED_FINGERPRINT: ${{ steps.compare.outputs.fingerprint }}
+        run: |
+          set -euo pipefail
+          python3 cloud/state_db.py compact data/radar.sqlite3
+          actual=$(python3 cloud/state_db.py fingerprint data/radar.sqlite3)
+          if [[ "$actual" != "$EXPECTED_FINGERPRINT" ]]; then
+            echo "::error::Compaction changed the material-state fingerprint"
+            exit 1
+          fi
+          bash cloud/persist_state.sh data/radar.sqlite3 "$actual"
+
+      - name: Prepare public RSS and history site
+        run: |
+          python3 cloud/publish_site.py \
+            --site site \
+            --database data/radar.sqlite3 \
+            --report reports/latest.json \
+            --base-url "$PUBLIC_BASE_URL"
+          python3 - <<'PY'
+          import xml.etree.ElementTree as ET
+          for path in ("site/feed.xml", "site/full.xml", "site/subscriptions.opml"):
+              ET.parse(path)
+              print("valid XML:", path)
+          PY
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload GitHub Pages artifact
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+          retention-days: 1
+          include-hidden-files: true
+
+  deploy:
+    needs: sync-and-build
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
+
+      - name: Check out notifier
+        if: needs.sync-and-build.outputs.state_changed == 'true'
+        uses: actions/checkout@v6
+
+      - name: Notify WebSub hub after material feed change
+        if: needs.sync-and-build.outputs.state_changed == 'true'
+        continue-on-error: true
+        run: |
+          python3 cloud/notify_websub.py \
+            "${PUBLIC_BASE_URL}full.xml" \
+            "${PUBLIC_BASE_URL}feed.xml" \
+            "${PUBLIC_BASE_URL}live.xml"
+
+  report-partial-failure:
+    needs: [sync-and-build, deploy]
+    if: always()
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+      - name: Preserve partial-sync failure signal after publishing
+        env:
+          SYNC_RESULT: ${{ needs.sync-and-build.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          SYNC_EXIT: ${{ needs.sync-and-build.outputs.sync_exit }}
+        run: |
+          if [[ "$SYNC_RESULT" != "success" || "$DEPLOY_RESULT" != "success" ]]; then
+            echo "Build or deployment failed."
+            exit 1
+          fi
+          if [[ "$SYNC_EXIT" == "2" ]]; then
+            echo "The partial result and source health were published, but at least one source failed."
+            exit 1
+          fi
+          echo "All sources synchronized and the public site was deployed."
