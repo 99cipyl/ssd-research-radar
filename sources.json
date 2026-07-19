@@ -30,6 +30,7 @@
         "program"
       ],
       "max_followed_pages": 2,
+      "fetch_revision": 2,
       "minimum_interval_hours": 6,
       "enabled": true
     },

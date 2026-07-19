@@ -108,6 +108,85 @@ class RadarUnitTests(unittest.TestCase):
         changed["content_fingerprint"] = "changed-linked-page"
         self.assertNotEqual(radar.content_hash(rows[0]), radar.content_hash(changed))
 
+    def test_fetch_configuration_change_bypasses_stale_poll_interval(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(radar.SCHEMA)
+        source = {
+            "id": "nvmw_official",
+            "name": "NVMW Official",
+            "kind": "page",
+            "category": "NVMW",
+            "homepage": "https://nvmw.ucsd.edu/",
+            "endpoint": "https://nvmw.ucsd.edu/",
+            "minimum_interval_hours": 6,
+            "enabled": True,
+        }
+        radar.register_sources(conn, {"sources": [source]})
+        conn.execute(
+            "UPDATE sources SET initialized=1,last_success_at='2026-07-19T00:00:00Z' WHERE id=?",
+            (source["id"],),
+        )
+        conn.commit()
+
+        radar.register_sources(conn, {"sources": [source]})
+        self.assertEqual(
+            conn.execute("SELECT last_success_at FROM sources WHERE id=?", (source["id"],)).fetchone()[0],
+            "2026-07-19T00:00:00Z",
+        )
+
+        changed = dict(source, follow_link_patterns=["program"])
+        radar.register_sources(conn, {"sources": [changed]})
+        row = conn.execute(
+            "SELECT initialized,last_success_at FROM sources WHERE id=?", (source["id"],)
+        ).fetchone()
+        self.assertEqual(row["initialized"], 1)
+        self.assertIsNone(row["last_success_at"])
+        conn.close()
+
+    def test_page_fingerprint_ignores_dynamic_markup_ids(self):
+        source = {
+            "id": "nvmw_official",
+            "name": "NVMW Official",
+            "endpoint": "https://nvmw.ucsd.edu/",
+        }
+        variants = [
+            b"<main><div id='ult_btn_2061355577'>Same announcement</div></main>",
+            b"<main><div id='ult_btn_560431465'>Same announcement</div></main>",
+        ]
+        with mock.patch.object(
+            radar, "request_bytes", side_effect=[(variants[0], {}), (variants[1], {})]
+        ):
+            first = radar.fetch_page(source, False, None)[0]
+            second = radar.fetch_page(source, False, None)[0]
+
+        self.assertEqual(first["content_fingerprint"], second["content_fingerprint"])
+        self.assertEqual(radar.content_hash(first), radar.content_hash(second))
+
+    def test_page_fingerprint_detects_linked_text_beyond_summary_limit(self):
+        source = {
+            "id": "nvmw_official",
+            "name": "NVMW Official",
+            "endpoint": "https://nvmw.ucsd.edu/",
+            "follow_link_patterns": ["program"],
+        }
+        homepage = b"<main>NVMW</main><a href='/program-3/'>Program</a>"
+
+        def variant(tail):
+            program = ("<main>" + ("X" * 35000) + tail + "</main>").encode()
+
+            def fake_request(url, *_args, **_kwargs):
+                return (homepage, {}) if url.endswith(".edu/") else (program, {})
+
+            with mock.patch.object(radar, "request_bytes", side_effect=fake_request):
+                return radar.fetch_page(source, False, None)[0]
+
+        first = variant("TAIL-A")
+        second = variant("TAIL-B")
+        self.assertEqual(first["summary"], second["summary"])
+        self.assertNotEqual(first["content_fingerprint"], second["content_fingerprint"])
+        self.assertNotEqual(radar.content_hash(first), radar.content_hash(second))
+
     def test_dblp_incremental_uses_latest_two_tocs_and_mirror_fallback(self):
         responses = self.dblp_fixture_responses()
         calls = []

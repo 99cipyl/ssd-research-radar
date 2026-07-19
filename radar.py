@@ -369,6 +369,10 @@ def register_sources(conn: sqlite3.Connection, config: Dict[str, Any]) -> None:
                 category=excluded.category,
                 homepage=excluded.homepage,
                 endpoint=excluded.endpoint,
+                last_success_at=CASE
+                    WHEN sources.config_json <> excluded.config_json THEN NULL
+                    ELSE sources.last_success_at
+                END,
                 config_json=excluded.config_json
             """,
             (
@@ -612,8 +616,12 @@ def fetch_page(source: Dict[str, Any], _full: bool, _since: Optional[str]) -> Li
     page_hashes: Dict[str, str] = {}
     for url, page_text in pages:
         body = html_main_body(page_text)
-        page_hashes[url] = hashlib.sha256(body.encode("utf-8", "replace")).hexdigest()
-        summaries.append(f"{url}\n{strip_html(body)}")
+        body_text = strip_html(body)
+        # Hash semantic text rather than raw WordPress markup. NVMW's page
+        # builder generates random element IDs, which must not look like a
+        # research update; the untruncated text still detects real changes.
+        page_hashes[url] = hashlib.sha256(body_text.encode("utf-8")).hexdigest()
+        summaries.append(f"{url}\n{body_text}")
     summary = "\n\n".join(summaries)[:30000]
     page_fingerprint = hashlib.sha256(
         json.dumps(page_hashes, ensure_ascii=False, sort_keys=True).encode("utf-8")
