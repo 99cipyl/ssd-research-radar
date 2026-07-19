@@ -12,6 +12,7 @@ remain eligible for retry.
 from __future__ import annotations
 
 import datetime as dt
+import email.utils
 import hashlib
 import hmac
 import html
@@ -31,12 +32,12 @@ import evidence
 GITHUB_MODELS_ENDPOINT = "https://models.github.ai/inference/chat/completions"
 DEFAULT_MODEL = "openai/gpt-4.1-mini"
 UTC = dt.timezone.utc
-BRIEF_TEMPLATE_VERSION = 4
-PROFESSIONAL_VALIDATION_VERSION = 1
+BRIEF_TEMPLATE_VERSION = 5
+PROFESSIONAL_VALIDATION_VERSION = 3
 
 EVIDENCE_LABELS = {
     "official_fulltext": "官方网页正文（专业模型整理；未核验 PDF 全文）",
-    "official_excerpt": "官方网页正文节选（专业模型仅读取前 12,000 字；未核验 PDF 全文）",
+    "official_excerpt": "官方网页正文节选（专业模型仅基于节选整理；未核验 PDF 全文）",
     "official_abstract": "官方摘要或官方元数据（专业模型整理）",
     "source_summary": "来源摘要 / 正文摘录（专业模型整理）",
     "none": "仅题名与元数据；不推断论文结论",
@@ -59,6 +60,17 @@ BRIEF_FIELDS = (
 )
 
 TEXT_FIELDS = tuple(field for field in BRIEF_FIELDS if field != "system_layers")
+CHINESE_NARRATIVE_FIELDS = (
+    "one_liner",
+    "what_it_is",
+    "problem",
+    "core_idea",
+    "mechanism",
+    "evidence",
+    "engineering_relevance",
+    "reading_guide",
+    "limitations",
+)
 
 ALLOWED_PROFESSIONAL_LAYERS = {
     "Host/应用", "NVMe/FE", "ICL", "FTL", "NMT/块管理", "GC/磨损均衡",
@@ -94,6 +106,10 @@ SYSTEM_PROMPT = """你是一名资深 SSD 控制器与 NAND 系统研究工程�
 6. title_zh 给出准确中文题名，SSD/NVMe/FTL/NAND/GC/ECC/LDPC/ZNS/FDP/KV 等缩写保留。
 7. 只输出合法 JSON，不得输出 Markdown、代码围栏或 JSON 之外的解释。
 8. supporting_quote 必须从输入的 summary_or_excerpt 中逐字复制一段不超过 25 个英文单词的短句，直接支持 core_idea；不得翻译、改写或拼接。没有证据时写“原页面未提供”。
+9. 必须为每一个输入 item 恰好返回一条 brief，item_id 和 public_id 原样复制；不得遗漏、合并或额外增加条目。
+10. one_liner、problem、core_idea、mechanism、evidence、limitations、engineering_relevance、reading_guide 中出现的每个数字及单位，都必须能在该 item 的 summary_or_excerpt 中找到同一事实依据。题名、发布日期和 DOI 不能充当技术结论或实验数据的证据；证据不足时改用不含数字的定性表述。
+11. title_zh 只能准确翻译原始 title，不得从摘要、发布日期或常识补入原题没有的年份、版本号、编号或其他数字；英文月份优先写成“一月、二月……”而不是新增阿拉伯数字；what_it_is 可描述输入明确给出的书目信息，但不得补入输入没有的数字。
+12. system_layers 必须逐项使用规则 5 的精确枚举字符串，禁止把多个层合并成“FTL / GC”一类标签。只有摘要/摘录明确讨论 SSD/NAND 数据回收时才能选择“GC/磨损均衡”；数据库 MVCC、对象回收或运行时垃圾回收不是 SSD GC，应选择“Host/应用”或“待判定”。
 """
 
 
@@ -433,12 +449,49 @@ def parse_brief(value: Any) -> Dict[str, Any]:
     return {field: result[field] for field in BRIEF_FIELDS}
 
 
+def _validate_publishable_content(brief: Mapping[str, Any]) -> None:
+    """Enforce the user's Chinese, evidence-backed publication contract."""
+
+    if brief.get("evidence_level") == "none":
+        raise ValueError("professional brief has no abstract or body evidence")
+    title = str(brief.get("title_zh") or "")
+    if not re.search(r"[\u3400-\u9fff]", title):
+        technical_tokens = {
+            "ssd", "nvme", "ftl", "nand", "gc", "ecc", "ldpc", "zns",
+            "fdp", "kv", "hil", "icl", "pal", "nal", "nmt", "hpp",
+            "qlc", "tlc", "mlc", "slc", "pcie", "cxl", "rber", "uber",
+            "waf", "iops", "smart", "nvmw", "xpoint", "flash", "ufs",
+        }
+        words = re.findall(r"[A-Za-z]+", title)
+        technical_only = bool(words) and (
+            all(
+                word.casefold() in technical_tokens
+                or (len(word) == 1 and word.isupper())
+                for word in words
+            )
+            or (len(words) == 1 and words[0].isupper() and len(words[0]) <= 12)
+        )
+        if not technical_only:
+            raise ValueError("professional brief title_zh is not Chinese")
+    non_chinese = [
+        field
+        for field in CHINESE_NARRATIVE_FIELDS
+        if not re.search(r"[\u3400-\u9fff]", str(brief.get(field) or ""))
+    ]
+    if non_chinese:
+        raise ValueError(
+            "professional brief narrative is not Chinese: "
+            + ", ".join(non_chinese)
+        )
+
+
 def professional_validation_hash(
     source_hash: str, model: str, brief: Mapping[str, Any]
 ) -> str:
     """Attest that a stored brief passed the evidence guard for this source."""
 
     parsed = parse_brief(brief)
+    _validate_publishable_content(parsed)
     payload = {
         "validation_version": PROFESSIONAL_VALIDATION_VERSION,
         "source_hash": str(source_hash),
@@ -464,14 +517,12 @@ def validate_professional_record(row: Mapping[str, Any]) -> Dict[str, Any]:
         raise ValueError("professional brief has no source hash")
     if parsed["evidence_level"] not in EVIDENCE_LABELS:
         raise ValueError("professional brief has an unknown evidence level")
+    _validate_publishable_content(parsed)
     invalid_layers = set(parsed["system_layers"]) - ALLOWED_PROFESSIONAL_LAYERS
     if invalid_layers or len(parsed["system_layers"]) > 12:
         raise ValueError("professional brief has invalid system layers")
     quote = _normalised_match_text(parsed["supporting_quote"])
-    if parsed["evidence_level"] == "none":
-        if quote != "原页面未提供" or parsed["system_layers"] != ["待判定"]:
-            raise ValueError("metadata-only brief contains unsupported claims")
-    elif quote == "原页面未提供" or len(quote.split()) > 25:
+    if quote == "原页面未提供" or len(quote.split()) > 25:
         raise ValueError("professional brief has an invalid supporting quote")
     elif parsed["evidence_level"] in {"source_summary", "official_abstract"}:
         stored_summary = _normalised_match_text(row.get("summary"))
@@ -577,17 +628,21 @@ def _candidate_rows(
 
     history_limit = max(0, int(history_limit))
     if history_limit:
-        excluded = {row["id"] for row in selected}
-        parameters: List[Any] = []
-        exclusion = ""
-        if excluded:
-            exclusion = "AND i.id NOT IN ({})".format(
-                ",".join("?" for _ in excluded)
-            )
-            parameters.extend(sorted(excluded))
-        parameters.extend([cutoff, history_limit])
-        selected.extend(
-            _dict_rows(
+        priority_count = len(selected)
+
+        def history_rows(status_clause: str, limit: int) -> List[Dict[str, Any]]:
+            if limit <= 0:
+                return []
+            excluded = {int(row["id"]) for row in selected}
+            parameters: List[Any] = []
+            exclusion = ""
+            if excluded:
+                exclusion = "AND i.id NOT IN ({})".format(
+                    ",".join("?" for _ in excluded)
+                )
+                parameters.extend(sorted(excluded))
+            parameters.extend([cutoff, limit])
+            return _dict_rows(
                 conn.execute(
                     f"""
                     SELECT i.id,i.canonical_key,i.item_type,i.title,i.url,i.doi,
@@ -596,7 +651,7 @@ def _candidate_rows(
                            (SELECT GROUP_CONCAT(DISTINCT x.source_id)
                             FROM item_sources x WHERE x.item_id=i.id) AS source_ids
                     FROM items i JOIN item_briefs b ON b.item_id=i.id
-                    WHERE b.status!='professional' {exclusion}
+                    WHERE {status_clause} {exclusion}
                       AND (b.status!='retry' OR b.last_attempt_at IS NULL OR b.last_attempt_at<=?)
                     ORDER BY COALESCE(i.published_at,'') DESC,
                              COALESCE(i.discovered_at,'') DESC,i.id DESC
@@ -605,8 +660,65 @@ def _candidate_rows(
                     parameters,
                 )
             )
+
+        # Reserve one fifth of a normal backfill batch for eligible retries.
+        # Without a fixed share, permanently invalid recent records can occupy
+        # the whole newest-first window and prevent older untouched history
+        # from ever receiving a professional brief.  A final fill query keeps
+        # the batch full when either class has fewer candidates than its share.
+        retry_quota = min(
+            history_limit - 1,
+            max(1, history_limit // 5),
+        ) if history_limit > 1 else 0
+        fresh_quota = history_limit - retry_quota
+        selected.extend(
+            history_rows("b.status NOT IN ('professional','retry')", fresh_quota)
         )
+        selected.extend(history_rows("b.status='retry'", retry_quota))
+        remaining = history_limit - (len(selected) - priority_count)
+        if remaining > 0:
+            selected.extend(history_rows("b.status!='professional'", remaining))
     return selected
+
+
+def _candidate_batches(
+    candidates: Sequence[Dict[str, Any]], batch_size: int
+) -> List[List[Dict[str, Any]]]:
+    """Build stable batches without placing duplicate titles together.
+
+    Community threads often contain several messages with exactly the same
+    subject. Giving two such records to the model in one request makes an
+    otherwise valid item easy to omit or merge. Distinct-title packing keeps
+    the original priority order and falls back to a one-item batch when only
+    duplicate subjects remain.
+    """
+
+    size = max(1, int(batch_size))
+    batches: List[List[Dict[str, Any]]] = []
+    batch: List[Dict[str, Any]] = []
+    titles: set[str] = set()
+    for item in candidates:
+        title = unicodedata.normalize(
+            "NFKC", _clean_text(item.get("title"), 800)
+        ).casefold()
+        title_key = title or f"item:{item.get('id')}"
+        # End the current batch at a duplicate instead of pulling a later
+        # history row forward. Candidate order carries the priority contract:
+        # every new/update item must stay ahead of historical backfill even if
+        # the time budget expires between requests.
+        if batch and (len(batch) >= size or title_key in titles):
+            batches.append(batch)
+            batch = []
+            titles = set()
+        batch.append(item)
+        titles.add(title_key)
+        if len(batch) >= size:
+            batches.append(batch)
+            batch = []
+            titles = set()
+    if batch:
+        batches.append(batch)
+    return batches
 
 
 def _eligible_priority_ids(
@@ -649,7 +761,6 @@ def _model_item(item: Mapping[str, Any]) -> Dict[str, Any]:
         "venue": _clean_text(item.get("venue"), 500),
         "published_at": _clean_text(item.get("published_at"), 100),
         "doi": _clean_text(item.get("doi"), 300),
-        "topics": _json_topics(item.get("topics_json")),
         "summary_or_excerpt": summary or "原页面未提供",
         "evidence_level": level,
         "evidence_source_url": _clean_text(
@@ -689,7 +800,9 @@ def _normalized_evidence_level(
     return "source_summary"
 
 
-def _enrich_candidates(candidates: Sequence[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+def _enrich_candidates(
+    candidates: Sequence[Mapping[str, Any]], *, timeout: float = 15
+) -> List[Dict[str, Any]]:
     enriched: List[Dict[str, Any]] = []
     for original in candidates:
         item = dict(original)
@@ -717,7 +830,7 @@ def _enrich_candidates(candidates: Sequence[Mapping[str, Any]]) -> List[Dict[str
         result: Mapping[str, Any] = {}
         if should_fetch:
             try:
-                result = evidence.enrich_item_evidence(item, ids)
+                result = evidence.enrich_item_evidence(item, ids, timeout=timeout)
             except Exception:
                 # The evidence extractor is already failure-contained, but a
                 # caller-side guard ensures a future extractor regression can
@@ -744,13 +857,20 @@ def _enrich_candidates(candidates: Sequence[Mapping[str, Any]]) -> List[Dict[str
 
 def _request_payload(model: str, items: Sequence[Mapping[str, Any]]) -> bytes:
     required = {
+        "validation_constraints": {
+            "exact_item_count": len(items),
+            "allowed_system_layers": sorted(ALLOWED_PROFESSIONAL_LAYERS),
+            "numeric_claim_evidence": "数字结论只能来自同一 item 的 summary_or_excerpt",
+            "title_translation": "title_zh 不得加入原始 title 没有的数字",
+            "quote": "supporting_quote 必须逐字复制且不超过 25 个英文单词",
+        },
         "response_schema": {
             "briefs": [
                 {
                     "item_id": "与输入一致的整数",
                     "public_id": "与输入一致的字符串",
                     **{field: "非空字符串" for field in TEXT_FIELDS},
-                    "system_layers": ["一个或多个非空字符串"],
+                    "system_layers": ["一个或多个精确枚举字符串，禁止合并标签"],
                 }
             ]
         },
@@ -775,6 +895,75 @@ def _request_payload(model: str, items: Sequence[Mapping[str, Any]]) -> bytes:
     return json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode(
         "utf-8"
     )
+
+
+def _estimated_input_tokens(payload: bytes) -> int:
+    """Conservatively estimate tokens for the free GitHub Models envelope."""
+
+    text = payload.decode("utf-8", errors="replace")
+    ascii_count = sum(ord(character) < 128 for character in text)
+    non_ascii_count = len(text) - ascii_count
+    # English JSON is commonly around four characters/token; CJK can approach
+    # one character/token. The extra margin covers punctuation/tokenizer drift.
+    return int(non_ascii_count + (ascii_count + 2) // 3 + 64)
+
+
+def _fit_request_budget(
+    model: str,
+    items: Sequence[Mapping[str, Any]],
+    max_input_tokens: int,
+) -> tuple[List[Dict[str, Any]], bytes]:
+    """Trim only evidence excerpts until a request fits the input limit."""
+
+    prepared = [dict(item) for item in items]
+    limit = max(1_000, int(max_input_tokens))
+    while True:
+        payload = _request_payload(model, prepared)
+        if _estimated_input_tokens(payload) <= limit:
+            return prepared, payload
+        candidates = [
+            item for item in prepared
+            if len(str(item.get("_evidence_text") or item.get("summary") or "")) > 600
+        ]
+        if not candidates:
+            raise ValueError("model request metadata exceeds the input-token budget")
+        longest = max(
+            candidates,
+            key=lambda item: len(str(item.get("_evidence_text") or item.get("summary") or "")),
+        )
+        evidence_text = str(longest.get("_evidence_text") or longest.get("summary") or "")
+        new_length = max(600, int(len(evidence_text) * 0.8))
+        shortened = evidence_text[:new_length].rsplit(" ", 1)[0].strip()
+        longest["_evidence_text"] = shortened or evidence_text[:new_length]
+        # Truncation changes completeness, not provenance.  Only a verified
+        # official full text becomes an official excerpt; an OpenAlex abstract
+        # or feed summary must never be upgraded to official page content just
+        # because the request budget required a shorter input.
+        evidence_level = str(longest.get("_evidence_level") or "").strip()
+        if evidence_level == "official_fulltext":
+            longest["_evidence_level"] = "official_excerpt"
+        elif not evidence_level:
+            longest["_evidence_level"] = "source_summary"
+        longest["_evidence_truncated"] = True
+
+
+def _retry_after_seconds(error: urllib.error.HTTPError, default: float = 8.0) -> float:
+    """Return a bounded Retry-After delay for one rate-limit retry."""
+
+    raw = error.headers.get("Retry-After") if error.headers else None
+    if raw:
+        try:
+            return max(0.0, min(60.0, float(raw)))
+        except (TypeError, ValueError):
+            try:
+                parsed = email.utils.parsedate_to_datetime(raw)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=UTC)
+                seconds = (parsed - dt.datetime.now(UTC)).total_seconds()
+                return max(0.0, min(60.0, seconds))
+            except (TypeError, ValueError, OverflowError):
+                pass
+    return max(0.0, min(60.0, float(default)))
 
 
 def _model_response(payload: Mapping[str, Any]) -> List[Dict[str, Any]]:
@@ -841,21 +1030,540 @@ def _normalised_match_text(value: Any) -> str:
 
 def _numeric_tokens(value: Any) -> set[str]:
     normalised = unicodedata.normalize("NFKC", str(value or ""))
-    tokens = re.findall(
-        r"(?<![\d.])\d+(?:\.\d+)?"
-        r"(?:(?:\s?(?:%|×|[xX]|倍|个百分点|(?i:times?|-?fold)))|"
-        r"(?:[A-WYZa-wyzµμ][A-Za-zµμ]*(?:/[A-Za-z]+)?))?"
-        r"(?![\dA-Za-zµμ])",
-        normalised,
-    )
+    # Treat conventional thousands separators as formatting, not as separate
+    # quantities (``100,000 IOPS`` must equal ``十万 IOPS``).
+    normalised = re.sub(r"(?<=\d),(?=\d)", "", normalised)
     result: set[str] = set()
-    for token in tokens:
-        cleaned = re.sub(r"\s+", "", token).casefold()
-        cleaned = re.sub(r"(?:×|倍|times?|-?fold)$", "x", cleaned)
-        cleaned = re.sub(r"个百分点$", "%", cleaned)
-        result.add(cleaned)
+    numeric_text = normalised
+
+    month_numbers = {
+        "January": "1", "February": "2", "March": "3", "April": "4",
+        "May": "5", "June": "6", "July": "7", "August": "8",
+        "September": "9", "October": "10", "November": "11",
+        "December": "12",
+        "Jan": "1", "Feb": "2", "Mar": "3", "Apr": "4",
+        "Jun": "6", "Jul": "7", "Aug": "8", "Sep": "9", "Sept": "9",
+        "Oct": "10", "Nov": "11", "Dec": "12",
+    }
+    month_pattern_text = "|".join(
+        sorted(month_numbers, key=len, reverse=True)
+    )
+    chinese_digits = {
+        "零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3,
+        "四": 4, "五": 5, "六": 6, "七": 7, "八": 8, "九": 9,
+    }
+    chinese_units = {"十": 10, "百": 100, "千": 1000}
+    chinese_integer_pattern = r"[零〇一二两三四五六七八九十百千万亿]+"
+    chinese_number_pattern = (
+        rf"(?:{chinese_integer_pattern}(?:点[零〇一二两三四五六七八九]+)?)"
+    )
+
+    def chinese_integer(raw: str) -> int:
+        if all(character in chinese_digits for character in raw):
+            return int("".join(str(chinese_digits[character]) for character in raw))
+        for character, multiplier in (("亿", 100_000_000), ("万", 10_000)):
+            if character in raw:
+                left, right = raw.split(character, 1)
+                left_value = chinese_integer(left) if left else 1
+                right_value = chinese_integer(right) if right else 0
+                return left_value * multiplier + right_value
+        total = 0
+        current = 0
+        for character in raw:
+            if character in chinese_digits:
+                current = chinese_digits[character]
+            else:
+                multiplier = chinese_units[character]
+                total += (current or 1) * multiplier
+                current = 0
+        return total + current
+
+    def chinese_number_value(raw: str) -> str:
+        if "点" not in raw:
+            return str(chinese_integer(raw))
+        integer_part, fractional_part = raw.split("点", 1)
+        if not fractional_part or not all(
+            character in chinese_digits for character in fractional_part
+        ):
+            raise ValueError("unsupported Chinese decimal")
+        fraction = "".join(str(chinese_digits[character]) for character in fractional_part)
+        value = f"{chinese_integer(integer_part) if integer_part else 0}.{fraction}"
+        return value.rstrip("0").rstrip(".")
+
+    def add_component(kind: str, raw: str) -> None:
+        result.add(f"{kind}:{int(raw)}")
+
+    def add_date(year: str | None, month: str, day: str) -> None:
+        month_number = int(month)
+        day_number = int(day)
+        if year:
+            result.add(
+                f"date:{int(year):04d}-{month_number:02d}-{day_number:02d}"
+            )
+            add_component("year", year)
+        else:
+            result.add(f"month-day:{month_number:02d}-{day_number:02d}")
+        add_component("month", month)
+        add_component("day", day)
+
+    def add_year_month(year: str, month: str) -> None:
+        result.add(f"year-month:{int(year):04d}-{int(month):02d}")
+        add_component("year", year)
+        add_component("month", month)
+
+    def mask_iso_date(match: re.Match[str]) -> str:
+        add_date(match.group(1), match.group(2), match.group(3))
+        return " DATE "
+
+    def mask_chinese_date(match: re.Match[str]) -> str:
+        add_date(match.group(1), match.group(2), match.group(3))
+        return " DATE "
+
+    def mask_chinese_month_day(match: re.Match[str]) -> str:
+        add_date(None, match.group(1), match.group(2))
+        return " DATE "
+
+    def mask_chinese_word_date(match: re.Match[str]) -> str:
+        year, month, day = (chinese_integer(match.group(index)) for index in (1, 2, 3))
+        if year < 1000 or not 1 <= month <= 12 or not 1 <= day <= 31:
+            return match.group(0)
+        add_date(str(year), str(month), str(day))
+        return " DATE "
+
+    def mask_chinese_word_month_day(match: re.Match[str]) -> str:
+        month, day = (chinese_integer(match.group(index)) for index in (1, 2))
+        if not 1 <= month <= 12 or not 1 <= day <= 31:
+            return match.group(0)
+        add_date(None, str(month), str(day))
+        return " DATE "
+
+    def mask_chinese_word_year_month(match: re.Match[str]) -> str:
+        year, month = (chinese_integer(match.group(index)) for index in (1, 2))
+        if year < 1000 or not 1 <= month <= 12:
+            return match.group(0)
+        add_year_month(str(year), str(month))
+        return " DATE "
+
+    def mask_chinese_word_year(match: re.Match[str]) -> str:
+        year = chinese_integer(match.group(1))
+        if year < 1000:
+            return match.group(0)
+        add_component("year", str(year))
+        return " DATEPART "
+
+    def mask_chinese_word_month(match: re.Match[str]) -> str:
+        month = chinese_integer(match.group(1))
+        if not 1 <= month <= 12:
+            return match.group(0)
+        add_component("month", str(month))
+        return " DATEPART "
+
+    def mask_chinese_word_day(match: re.Match[str]) -> str:
+        day = chinese_integer(match.group(1))
+        if not 1 <= day <= 31:
+            return match.group(0)
+        add_component("day", str(day))
+        return " DATEPART "
+
+    def mask_english_month_day(match: re.Match[str]) -> str:
+        add_date(match.group(3), month_numbers[match.group(1)], match.group(2))
+        return " DATE "
+
+    def mask_english_day_month(match: re.Match[str]) -> str:
+        add_date(match.group(3), month_numbers[match.group(2)], match.group(1))
+        return " DATE "
+
+    def mask_english_month_year(match: re.Match[str]) -> str:
+        add_year_month(match.group(2), month_numbers[match.group(1)])
+        return " DATE "
+
+    def mask_chinese_year_month(match: re.Match[str]) -> str:
+        add_year_month(match.group(1), match.group(2))
+        return " DATE "
+
+    def mask_english_month_range(match: re.Match[str]) -> str:
+        year = match.group(3)
+        add_year_month(year, month_numbers[match.group(1)])
+        add_year_month(year, month_numbers[match.group(2)])
+        return " DATE "
+
+    def mask_chinese_month_range(match: re.Match[str]) -> str:
+        year = match.group(1)
+        add_year_month(year, match.group(2))
+        add_year_month(year, match.group(3))
+        return " DATE "
+
+    def mask_year(match: re.Match[str]) -> str:
+        add_component("year", match.group(1))
+        return " DATEPART "
+
+    def mask_month(match: re.Match[str]) -> str:
+        add_component("month", match.group(1))
+        return " DATEPART "
+
+    def mask_day(match: re.Match[str]) -> str:
+        add_component("day", match.group(1))
+        return " DATEPART "
+
+    def mask_time(match: re.Match[str]) -> str:
+        hour = int(match.group(1))
+        minute = int(match.group(2))
+        second = match.group(3)
+        token = f"time:{hour:02d}:{minute:02d}"
+        if second is not None:
+            token += f":{int(second):02d}"
+        result.add(token)
+        add_component("hour", match.group(1))
+        add_component("minute", match.group(2))
+        if second is not None:
+            add_component("second", second)
+        return " TIME "
+
+    # Parse complete calendar expressions first and replace their digits before
+    # generic extraction.  A complete typed token prevents evidence containing
+    # "May 1" and "June 2" from authorising a fabricated "June 1".  Component
+    # tokens still allow a faithful shorter rendering such as "in 2026".
+    numeric_text = re.sub(
+        r"(?<!\d)(\d{4})[-/](1[0-2]|0[1-9])[-/](3[01]|[12]\d|0[1-9])(?!\d)",
+        mask_iso_date,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        r"(?<!\d)(\d{4})\s*年\s*(1[0-2]|0?[1-9])\s*月\s*"
+        r"(3[01]|[12]\d|0?[1-9])\s*(?:日|号)",
+        mask_chinese_date,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        r"(?<![\d.])(1[0-2]|0?[1-9])\s*月\s*"
+        r"(3[01]|[12]\d|0?[1-9])\s*(?:日|号)",
+        mask_chinese_month_day,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        rf"({chinese_integer_pattern})年\s*({chinese_integer_pattern})月\s*"
+        rf"({chinese_integer_pattern})(?:日|号)",
+        mask_chinese_word_date,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        rf"({chinese_integer_pattern})月\s*({chinese_integer_pattern})(?:日|号)",
+        mask_chinese_word_month_day,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        rf"\b({month_pattern_text})\s*(?:&|and|to|through|[-–—])\s*"
+        rf"({month_pattern_text})\s+(\d{{4}})\b",
+        mask_english_month_range,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        r"(?<!\d)(\d{4})\s*年\s*(1[0-2]|0?[1-9])\s*月\s*"
+        r"(?:和|与|至|到|[-–—、])\s*(1[0-2]|0?[1-9])\s*月",
+        mask_chinese_month_range,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        rf"\b({month_pattern_text})\s+(\d{{1,2}})(?:st|nd|rd|th)?"
+        rf"(?:\s*,?\s*(\d{{4}}))?\b",
+        mask_english_month_day,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        rf"(?<!\d)(\d{{1,2}})(?:st|nd|rd|th)?\s+"
+        rf"({month_pattern_text})(?:\s*,?\s*(\d{{4}}))?\b",
+        mask_english_day_month,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        rf"\b({month_pattern_text})\s+(\d{{4}})\b",
+        mask_english_month_year,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        r"(?<!\d)(\d{4})\s*年\s*(1[0-2]|0?[1-9])\s*月",
+        mask_chinese_year_month,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        rf"({chinese_integer_pattern})年\s*({chinese_integer_pattern})月",
+        mask_chinese_word_year_month,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        r"(?<!\d)(\d{4})\s*年",
+        mask_year,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        r"(?<![\d.])(1[0-2]|0?[1-9])\s*月",
+        mask_month,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        r"(?<![\d.])(3[01]|[12]\d|0?[1-9])\s*(?:日|号)",
+        mask_day,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        rf"({chinese_integer_pattern})年",
+        mask_chinese_word_year,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        rf"({chinese_integer_pattern})月(?:份)?",
+        mask_chinese_word_month,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        rf"({chinese_integer_pattern})(?:日|号)",
+        mask_chinese_word_day,
+        numeric_text,
+    )
+    numeric_text = re.sub(
+        r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?::([0-5]\d))?(?!\d)",
+        mask_time,
+        numeric_text,
+    )
+    number_pattern = r"\d+(?:\.\d+)?"
+    # Always retain the bare magnitude as well as any unit-qualified token.
+    # This makes ``62.8%`` and ``百分之 62.8`` equivalent while a claim changing
+    # ``1.5 GB/s`` into ``1.5 TB/s`` still fails on the qualified token.
+    for value in re.findall(
+        rf"(?<![\d.])({number_pattern})(?![\d.])", numeric_text
+    ):
+        result.add(value)
+
+    quantity_unit_pattern = (
+        r"(?:个|种)?工作负载|个?设备|(?:个|种)?配置|(?:个|种)?方案|个?阶段|个?步骤|"
+        r"个?层级|个?页面|个?块|个?分组|个?核心|个?通道|"
+        r"篇?论文|类?方法|台?设备|条?结论|章?内容|节?实验|名?作者|"
+        r"workloads?|devices?|configurations?|stages?|steps?|layers?|"
+        r"pages?|blocks?|groups?|rounds?|cores?|channels?|papers?|methods?|"
+        r"conclusions?|chapters?|sections?|authors?|experiments?|"
+        r"个|项|种|次|层|位|页|块|组|轮|路|核|级|维|篇|类|台|条|章|节|名"
+    )
+    unit_pattern = (
+        r"%|个百分点|(?i:percent|percentage\s*points?)|"
+        r"×|[xX]|倍|(?i:times?|[- ]?fold)|"
+        r"[KMGTPEkmgtpe]?i?[Bb](?:/s|ps)?|"
+        r"[KMGTPEkmgtpe]?[Bb]ps|"
+        r"[KMGkmg]?IOPS|IOPS|QPS|"
+        r"ns|nanoseconds?|us|usecs?|µs|μs|microseconds?|"
+        r"ms|milliseconds?|sec(?:ond)?s?|s|minutes?|mins?|hours?|hrs?|"
+        r"纳秒|微秒|毫秒|秒|分钟|小时|"
+        r"[kMGT]?Hz|GHz|MHz|kHz|"
+        r"DWPD|TBW|WAF|P/E(?:\s*cycles?)?|cycles?|"
+        r"[fpnumkMGTPE]?W|[fpnumkMGTPE]?J|瓦|焦耳|"
+        + quantity_unit_pattern
+        + r"|[A-Za-zµμ]+(?:/[A-Za-z]+)?"
+    )
+
+    def canonical_unit(raw: str) -> str:
+        compact = re.sub(r"\s+", "", raw)
+        folded = compact.casefold().replace("μ", "u").replace("µ", "u")
+        if folded == "%" or folded == "percent":
+            return "%"
+        if folded in {"个百分点", "percentagepoint", "percentagepoints"}:
+            return "pp"
+        if folded in {"x", "×", "倍", "time", "times", "fold", "-fold"}:
+            return "x"
+        byte_match = re.fullmatch(
+            r"([KMGTPEkmgtpe]?i?)([Bb])(?:(/s)|ps)?", compact
+        )
+        if byte_match:
+            prefix = byte_match.group(1).casefold()
+            quantity = "byte" if byte_match.group(2) == "B" else "bit"
+            per_second = bool(byte_match.group(3) or compact.endswith("ps"))
+            return f"{prefix}{quantity}" + ("/s" if per_second else "")
+        aliases = {
+            "nanosecond": "ns", "nanoseconds": "ns", "纳秒": "ns",
+            "usec": "us", "usecs": "us", "microsecond": "us",
+            "microseconds": "us", "微秒": "us", "millisecond": "ms",
+            "milliseconds": "ms", "毫秒": "ms", "second": "s",
+            "seconds": "s", "sec": "s", "secs": "s", "秒": "s",
+            "minute": "min", "minutes": "min", "min": "min",
+            "mins": "min", "分钟": "min", "hour": "h", "hours": "h",
+            "hr": "h", "hrs": "h", "小时": "h",
+            "瓦": "w", "焦耳": "j",
+            "workload": "workload", "workloads": "workload",
+            "工作负载": "workload", "种工作负载": "workload",
+            "个工作负载": "workload",
+            "device": "device", "devices": "device", "设备": "device",
+            "个设备": "device",
+            "configuration": "configuration", "configurations": "configuration",
+            "配置": "configuration", "种配置": "configuration",
+            "个配置": "configuration", "方案": "configuration",
+            "种方案": "configuration", "个方案": "configuration",
+            "stage": "stage", "stages": "stage", "阶段": "stage",
+            "个阶段": "stage", "step": "step", "steps": "step",
+            "步骤": "step", "个步骤": "step",
+            "layer": "layer", "layers": "layer", "层": "layer",
+            "层级": "layer", "个层级": "layer", "page": "page",
+            "pages": "page", "页": "page", "页面": "page",
+            "个页面": "page", "block": "block",
+            "blocks": "block", "块": "block", "个块": "block",
+            "group": "group", "groups": "group", "组": "group",
+            "分组": "group", "个分组": "group", "round": "round",
+            "rounds": "round", "轮": "round", "core": "core",
+            "cores": "core", "核": "core", "核心": "core",
+            "个核心": "core", "channel": "channel", "channels": "channel",
+            "路": "channel", "通道": "channel", "个通道": "channel",
+            "次": "occurrence", "位": "position", "级": "level",
+            "维": "dimension", "paper": "paper", "papers": "paper",
+            "论文": "paper", "篇论文": "paper", "method": "method",
+            "methods": "method", "方法": "method", "类方法": "method",
+            "台设备": "device", "conclusion": "conclusion",
+            "conclusions": "conclusion", "结论": "conclusion",
+            "条结论": "conclusion", "chapter": "chapter",
+            "chapters": "chapter", "内容": "chapter", "章内容": "chapter",
+            "section": "section", "sections": "section",
+            "experiment": "experiment", "experiments": "experiment",
+            "实验": "experiment", "节实验": "experiment", "author": "author",
+            "authors": "author", "作者": "author", "名作者": "author",
+            "个": "count", "项": "count", "种": "count", "篇": "paper",
+            "类": "category", "台": "device", "条": "count",
+            "章": "chapter", "节": "section", "名": "person",
+        }
+        return aliases.get(folded, folded)
+
+    for match in re.finditer(
+        rf"(?<![\d.])({number_pattern})\s*({unit_pattern})(?![A-Za-z])",
+        numeric_text,
+    ):
+        result.add(match.group(1) + canonical_unit(match.group(2)))
     for value in re.findall(r"百分之\s*(\d+(?:\.\d+)?)", normalised):
-        result.add(value + "%")
+        result.update((value, value + "%"))
+
+    for match in re.finditer(
+        rf"百分之\s*({chinese_number_pattern})",
+        numeric_text,
+    ):
+        value = chinese_number_value(match.group(1))
+        result.update((value, value + "%"))
+
+    for match in re.finditer(
+        rf"(第)?({chinese_number_pattern})\s*"
+        rf"({unit_pattern})",
+        numeric_text,
+    ):
+        value = chinese_number_value(match.group(2))
+        suffix = match.group(3)
+        canonical_suffix = canonical_unit(suffix)
+        # ``一项研究``/``一种方法``/``一个方案`` often function as an
+        # indefinite article rather than a quantitative result. Do not create a
+        # false numeric claim unless it is ordinal or a specific typed unit.
+        indefinite_units = {
+            "count", "paper", "method", "category", "device", "configuration",
+            "conclusion", "chapter", "section", "experiment", "author", "person",
+        }
+        if (
+            value == "1"
+            and not match.group(1)
+            and canonical_suffix in indefinite_units
+        ):
+            continue
+        result.add(value)
+        if suffix == "%":
+            result.add(value + "%")
+        elif suffix == "个百分点":
+            result.add(value + "pp")
+        elif suffix == "倍":
+            result.add(value + "x")
+        else:
+            result.add(value + canonical_suffix)
+
+    english_numbers = {
+        "zero": 0, "one": 1, "two": 2, "three": 3, "four": 4,
+        "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9,
+        "ten": 10, "eleven": 11, "twelve": 12, "thirteen": 13,
+        "fourteen": 14, "fifteen": 15, "sixteen": 16,
+        "seventeen": 17, "eighteen": 18, "nineteen": 19,
+        "twenty": 20, "thirty": 30, "forty": 40, "fifty": 50,
+        "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90,
+    }
+    english_scales = {
+        "hundred": 100,
+        "thousand": 1_000,
+        "million": 1_000_000,
+        "billion": 1_000_000_000,
+    }
+
+    def english_number_value(raw: str) -> str:
+        total = 0
+        current = 0
+        for word in re.split(r"[\s-]+", raw.casefold().strip()):
+            if not word or word == "and":
+                continue
+            if word in english_numbers:
+                current += english_numbers[word]
+            elif word == "hundred":
+                current = (current or 1) * 100
+            else:
+                scale = english_scales[word]
+                total += (current or 1) * scale
+                current = 0
+        return str(total + current)
+    english_context = (
+        r"percent|percentage points?|times?|fold|workloads?|devices?|"
+        r"configurations?|stages?|steps?|layers?|pages?|blocks?|"
+        r"papers?|methods?|conclusions?|chapters?|sections?|authors?|experiments?|"
+        r"[KMGTPE]?i?[Bb](?:/s|ps)?|[KMG]?IOPS|IOPS|QPS|"
+        r"nanoseconds?|microseconds?|milliseconds?|seconds?|minutes?|hours?"
+    )
+    english_number_word = "|".join(
+        [*english_numbers, *english_scales, "and"]
+    )
+    for match in re.finditer(
+        rf"\b((?:{english_number_word})(?:(?:[\s-]+)(?:{english_number_word})){{0,11}})"
+        rf"[\s-]+({english_context})\b",
+        normalised,
+        re.IGNORECASE,
+    ):
+        value = english_number_value(match.group(1))
+        result.add(value)
+        suffix = match.group(2)
+        folded_suffix = suffix.casefold()
+        if folded_suffix == "percent":
+            result.add(value + "%")
+        elif folded_suffix.startswith("percentage point"):
+            result.add(value + "pp")
+        elif folded_suffix in {"time", "times", "fold"}:
+            result.add(value + "x")
+        elif re.fullmatch(unit_pattern, suffix):
+            result.add(value + canonical_unit(suffix))
+    # Date ranges such as ``June & July 2026`` need standalone month components
+    # for a faithful Chinese translation. Lower-case modal ``may`` and verbs
+    # such as ``March forward`` must not authorise calendar numbers.
+    month_pattern = re.compile(r"\b(" + month_pattern_text + r")\b")
+    month_matches = list(month_pattern.finditer(normalised))
+    for match in month_matches:
+        before = normalised[max(0, match.start() - 32) : match.start()]
+        after = normalised[match.end() : match.end() + 32]
+        adjacent_date = bool(
+            re.search(r"\d{1,4}(?:st|nd|rd|th)?[\s,/-]*$", before)
+            or re.match(r"^[\s,/-]*\d{1,4}(?:st|nd|rd|th)?\b", after)
+        )
+        contextual_date = bool(
+            re.search(
+                r"\b(?:in|on|during|from|through|until|since|this|next|last)\s+$",
+                before,
+                re.IGNORECASE,
+            )
+        )
+        paired_month = False
+        for other in month_matches:
+            if other is match:
+                continue
+            left, right = sorted((match, other), key=lambda candidate: candidate.start())
+            if right.start() - left.end() > 20:
+                continue
+            connector = normalised[left.end() : right.start()]
+            if re.fullmatch(r"\s*(?:,|&|/|-|and|to|through)\s*", connector, re.I):
+                paired_month = True
+                break
+        if adjacent_date or contextual_date or paired_month:
+            add_component("month", month_numbers[match.group(1)])
     return result
 
 
@@ -865,23 +1573,9 @@ def _apply_provenance_guard(
     """Make evidence provenance authoritative and block title-only invention."""
 
     if level == "none":
-        guarded = _fallback_brief(item)
-        guarded.update({
-            "title_zh": _clean_text(item.get("title"), 600) or "未命名资料",
-            "one_liner": "当前只能确认题名和基础元数据；来源没有提供可用于总结的摘要或正文。",
-            "what_it_is": "资料类型与书目信息已保存，但技术内容原页面未提供。",
-            "problem": "原页面未提供。",
-            "core_idea": "原页面未提供，不能仅凭题名推断核心思想。",
-            "supporting_quote": "原页面未提供",
-            "mechanism": "原页面未提供。",
-            "evidence": "当前可核验信息仅有题名及基础元数据。",
-            "system_layers": ["待判定"],
-            "engineering_relevance": "原页面未提供足够信息，暂不能可靠判断对具体 SSD 模块的工程价值。",
-            "reading_guide": "先获取官方摘要或正文，再判断问题、机制、结果和 SSD 层级。",
-            "limitations": "问题、核心思想、实现机制、结果和适用边界均缺少摘要或正文证据。",
-            "evidence_level": "none",
-        })
-        return parse_brief(guarded)
+        raise ValueError(
+            "source has no abstract or body evidence; professional brief withheld"
+        )
 
     evidence_text = _normalised_match_text(
         _model_item(item).get("summary_or_excerpt")
@@ -900,6 +1594,90 @@ def _apply_provenance_guard(
         )
     if len(brief["system_layers"]) > 12:
         raise ValueError("system_layers contains more than 12 entries")
+    _validate_publishable_content(brief)
+    semantic_text = " ".join((str(item.get("title") or ""), evidence_text))
+    layer_evidence_patterns = {
+        "Host/应用": (
+            r"(?i)\b(?:host|application|database|MVCC|file ?system|operating system|"
+            r"user space|kernel|object store|software|workload)\b|主机|应用|数据库|"
+            r"文件系统|操作系统|用户态|内核|对象存储|软件|工作负载"
+        ),
+        "NVMe/FE": (
+            r"(?i)\b(?:NVMe|NVM Express|PCIe|HIL|host interface layer|front[- ]end|"
+            r"submission queue|completion queue|doorbell|NVMe commands?|namespaces?)\b|"
+            r"主机接口层|前端|主机命令|提交队列|完成队列"
+        ),
+        "ICL": (
+            r"(?i)\b(?:ICL|internal controller (?:layer|interface)|"
+            r"controller interconnect|on-chip interconnect)\b|控制器内部接口|片上互联"
+        ),
+        "FTL": (
+            r"(?i)\b(?:FTL|flash translation|logical-to-physical|L2P|P2L|"
+            r"address mapping|mapping table)\b|闪存转换层|逻辑物理映射|映射表"
+        ),
+        "NMT/块管理": (
+            r"(?i)\b(?:NMT|NAND management|media management|block management|"
+            r"block manager|block allocation|block metadata|bad blocks?|free blocks?|"
+            r"free block pool)\b|介质管理|块管理|坏块|空闲块|空闲块池|块分配|块元数据"
+        ),
+        "NAL/PAL": (
+            r"(?i)\b(?:(?:NAL|PAL)|NAND (?:abstraction|interface|commands?|channel)|"
+            r"flash (?:abstraction|interface|commands?|channel)|physical abstraction)\b|"
+            r"NAND抽象|闪存抽象|NAND接口|闪存接口|NAND通道|闪存通道"
+        ),
+        "NAND": (
+            r"(?i)\b(?:NAND|flash memory|flash cells?|wordlines?|page (?:read|program)|"
+            r"program/erase|P/E cycles?|erase blocks?)\b|闪存介质|闪存单元|字线|"
+            r"页读取|页编程|编程擦除|擦除块"
+        ),
+        "ECC/LDPC": (
+            r"(?i)\b(?:ECC|LDPC|error[- ]correct(?:ing|ion)|decoder|decoding|"
+            r"codeword|correctable|uncorrectable)\b|纠错码|错误纠正|译码|码字|不可纠正"
+        ),
+        "可靠性": (
+            r"(?i)\b(?:reliability|retention|read disturb|program disturb|endurance|"
+            r"read[- ]retry|read reclaim|soft decoding|read refresh|RBER|UBER|"
+            r"wear[- ]out|data loss|faults?|failures?|bit errors?)\b|"
+            r"可靠性|数据保持|读扰|编程干扰|耐久性|读重试|读取回收|软译码|读取刷新|"
+            r"磨损失效|数据丢失|故障|位错误"
+        ),
+        "运维/巡检": (
+            r"(?i)\b(?:patrol|scrub(?:bing)?|media scan|background scan|inspection|"
+            r"health monitoring|telemetry|S\.M\.A\.R\.T\.?|SMART)\b|巡检|巡查|"
+            r"介质扫描|后台扫描|健康监控|遥测"
+        ),
+        "KV/计算存储": (
+            r"(?i)\b(?:key[- ]value|KV SSD|computational storage|key-value)\b|"
+            r"键值存储|计算存储"
+        ),
+    }
+    for layer, pattern in layer_evidence_patterns.items():
+        if layer in brief["system_layers"] and not re.search(pattern, semantic_text):
+            raise ValueError(f"system layer {layer!r} is absent from source evidence")
+    if "GC/磨损均衡" in brief["system_layers"]:
+        non_ssd_gc = re.search(
+            r"(?i)\b(?:MVCC|OLTP|tuple[- ]version|database|object graph|"
+            r"managed heap|runtime garbage collection)\b|数据库|元组版本|对象回收|运行时垃圾回收",
+            semantic_text,
+        )
+        ssd_gc = re.search(
+            r"(?i)\b(?:FTL\s+(?:garbage collection|GC)|"
+            r"(?:SSD|NAND|flash(?: storage)?|solid[- ]state drives?)\s*"
+            r"(?:internal\s*)?(?:garbage collection|GC|block reclamation)|"
+            r"(?:garbage collection|GC)\s+(?:in|for|inside|within|of)\s+"
+            r"(?:SSDs?|NAND|flash(?: storage)?|solid[- ]state drives?)|"
+            r"(?:invalid pages?|erase blocks?).{0,60}(?:reclaim|garbage collection|GC)|"
+            r"(?:reclaim|garbage collection|GC).{0,60}(?:invalid pages?|erase blocks?)|"
+            r"wear leveling)\b|"
+            r"FTL\s*(?:垃圾回收|GC)|(?:SSD|NAND|闪存|固态盘)(?:内部)?垃圾回收|"
+            r"(?:无效页|擦除块).{0,30}(?:回收|垃圾回收)|"
+            r"(?:回收|垃圾回收).{0,30}(?:无效页|擦除块)|磨损均衡|块回收",
+            semantic_text,
+        )
+        if not ssd_gc:
+            if non_ssd_gc:
+                raise ValueError("database/runtime GC must not be labelled as SSD GC")
+            raise ValueError("SSD GC layer requires explicit SSD/NAND/FTL evidence")
     evidence_claims = " ".join(
         brief[field]
         for field in (
@@ -909,7 +1687,11 @@ def _apply_provenance_guard(
     )
     model_input = _model_item(item)
     evidence_numbers = _numeric_tokens(model_input.get("summary_or_excerpt"))
-    for number in _numeric_tokens(evidence_claims):
+    claim_numbers = _numeric_tokens(evidence_claims)
+    numeric_order = lambda token: (  # qualified claims produce useful errors first
+        bool(re.fullmatch(r"\d+(?:\.\d+)?", token)), token
+    )
+    for number in sorted(claim_numbers, key=numeric_order):
         if number not in evidence_numbers:
             raise ValueError(f"numeric claim {number!r} is absent from evidence")
 
@@ -923,11 +1705,11 @@ def _apply_provenance_guard(
         )
     )
     metadata_numbers = _numeric_tokens(metadata_text)
-    for number in _numeric_tokens(brief["what_it_is"]):
+    for number in sorted(_numeric_tokens(brief["what_it_is"]), key=numeric_order):
         if number not in metadata_numbers:
             raise ValueError(f"numeric metadata {number!r} is absent from input")
     title_numbers = _numeric_tokens(model_input.get("title"))
-    for number in _numeric_tokens(brief["title_zh"]):
+    for number in sorted(_numeric_tokens(brief["title_zh"]), key=numeric_order):
         if number not in title_numbers:
             raise ValueError(f"numeric title claim {number!r} is absent from title")
     brief["evidence_level"] = level
@@ -956,6 +1738,10 @@ def generate_professional_briefs(
     retry_after_seconds: int = 6 * 60 * 60,
     max_priority_items: int = 12,
     time_budget_seconds: int = 300,
+    request_interval_seconds: float = 0.0,
+    max_requests: int = 60,
+    max_input_tokens: int = 7_000,
+    max_rate_limit_retries: int = 1,
 ) -> Dict[str, Any]:
     """Generate validated professional briefs through GitHub Models.
 
@@ -984,6 +1770,7 @@ def generate_professional_briefs(
         "failed_item_ids": [],
         "errors": [],
         "deferred": 0,
+        "requests": 0,
         "model": model,
     }
     if not candidates:
@@ -1006,45 +1793,102 @@ def generate_professional_briefs(
         )
         return result
 
-    # Evidence fetching happens only once a token is available and an API call
-    # will actually be attempted.  This prevents pointless upstream traffic on
-    # a misconfigured workflow.
-    candidates = _enrich_candidates(candidates)
-
     started = time.monotonic()
-    for start in range(0, len(candidates), batch_size):
-        if time.monotonic() - started >= max(1, int(time_budget_seconds)):
-            result["deferred"] += len(candidates) - start
+    budget = max(1, int(time_budget_seconds))
+    request_limit = max(1, int(max_requests))
+    request_interval = max(0.0, float(request_interval_seconds))
+    rate_limit_retries = max(0, min(3, int(max_rate_limit_retries)))
+    request_count = 0
+    last_request_started: Optional[float] = None
+    processed = 0
+    for raw_batch in _candidate_batches(candidates, batch_size):
+        elapsed = time.monotonic() - started
+        if elapsed >= budget or request_count >= request_limit:
+            result["deferred"] += len(candidates) - processed
             break
-        batch = candidates[start : start + batch_size]
+        # Fetch evidence one batch at a time so a large historical selection
+        # cannot spend the entire job timeout before the model budget starts.
+        # A known extractor performs at most two sequential requests per item.
+        evidence_timeout = max(
+            0.1,
+            min(15.0, (budget - elapsed) / max(1, len(raw_batch) * 2)),
+        )
+        batch = _enrich_candidates(raw_batch, timeout=evidence_timeout)
+        remaining = budget - (time.monotonic() - started)
+        if remaining < 1:
+            result["deferred"] += len(candidates) - processed
+            break
+        processed += len(batch)
         ids = [item["id"] for item in batch]
         attempted_at = _now()
-        request = urllib.request.Request(
-            endpoint,
-            data=_request_payload(model, batch),
-            headers={
-                "Accept": "application/json",
-                "Authorization": f"Bearer {stripped_token}",
-                "Content-Type": "application/json; charset=utf-8",
-                "User-Agent": "SSD-Research-Radar/briefs",
-                "X-GitHub-Api-Version": "2022-11-28",
-            },
-            method="POST",
-        )
         try:
-            with _model_urlopen(request, timeout=timeout) as response:
-                raw = response.read(5 * 1024 * 1024)
+            batch, request_data = _fit_request_budget(
+                model, batch, max_input_tokens
+            )
+            request = urllib.request.Request(
+                endpoint,
+                data=request_data,
+                headers={
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {stripped_token}",
+                    "Content-Type": "application/json; charset=utf-8",
+                    "User-Agent": "SSD-Research-Radar/briefs",
+                    "X-GitHub-Api-Version": "2022-11-28",
+                },
+                method="POST",
+            )
+            rate_attempt = 0
+            while True:
+                now = time.monotonic()
+                if last_request_started is not None:
+                    wait = request_interval - (now - last_request_started)
+                    if wait > 0:
+                        if budget - (now - started) <= wait + 1:
+                            raise TimeoutError("model request interval exceeds remaining budget")
+                        time.sleep(wait)
+                remaining = budget - (time.monotonic() - started)
+                if remaining < 1 or request_count >= request_limit:
+                    raise TimeoutError("model request budget exhausted")
+                request_timeout = max(1, min(int(timeout), int(remaining)))
+                last_request_started = time.monotonic()
+                request_count += 1
+                result["requests"] = request_count
+                try:
+                    with _model_urlopen(request, timeout=request_timeout) as response:
+                        raw = response.read(5 * 1024 * 1024)
+                    break
+                except urllib.error.HTTPError as exc:
+                    if (
+                        exc.code != 429
+                        or rate_attempt >= rate_limit_retries
+                        or request_count >= request_limit
+                    ):
+                        raise
+                    delay = max(request_interval, _retry_after_seconds(exc))
+                    remaining = budget - (time.monotonic() - started)
+                    if remaining <= delay + 1:
+                        raise
+                    time.sleep(delay)
+                    rate_attempt += 1
             api_payload = json.loads(raw.decode("utf-8"))
             generated = _model_response(api_payload)
             by_id: Dict[int, Dict[str, Any]] = {}
+            response_ids: List[int] = []
             for value in generated:
                 try:
                     item_id = int(value.get("item_id"))
                 except (TypeError, ValueError):
                     continue
+                response_ids.append(item_id)
                 if item_id in by_id:
                     continue
                 by_id[item_id] = value
+
+            expected_ids = [int(item["id"]) for item in batch]
+            if len(response_ids) != len(expected_ids) or sorted(response_ids) != sorted(expected_ids):
+                raise ValueError(
+                    "model response item set does not exactly match the request"
+                )
 
             failed_in_batch: List[int] = []
             for item in batch:

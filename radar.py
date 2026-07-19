@@ -49,6 +49,7 @@ REPORTS_DIR = ROOT / "reports"
 USER_AGENT = "SSD-Research-Radar/1.0 (+local research archive)"
 MAX_RESPONSE_BYTES = 50 * 1024 * 1024
 MAX_FEED_ITEMS = 350
+ARCHIVE_BUCKET_COUNT = 32
 LOCAL_BASE_URL = "http://127.0.0.1:8765/"
 UTC = dt.timezone.utc
 
@@ -1603,10 +1604,17 @@ def rss_xml(
             "href": validated_http_url(hub_url, "RADAR_WEBSUB_HUB"), "rel": "hub",
         })
     for row in rows:
+        if (
+            "brief_status" not in row.keys()
+            or row["brief_status"] != "professional"
+            or "brief_json" not in row.keys()
+        ):
+            raise ValueError("RSS rows must have a validated professional brief")
+        professional_brief = briefs.parse_brief(row["brief_json"])
         event_type = row["event_type"] if "event_type" in row.keys() else "new"
         item = ET.SubElement(channel, "item")
         prefix = "" if archive else ("[更新] " if event_type == "updated" else "")
-        ET.SubElement(item, "title").text = prefix + row["title"]
+        ET.SubElement(item, "title").text = prefix + professional_brief["title_zh"]
         event_key = None
         if not archive:
             run_id = row["run_id"] if "run_id" in row.keys() else 0
@@ -1630,12 +1638,8 @@ def rss_xml(
         except Exception:
             pass
         event_label = "历史资料" if archive else ("已有资料更新" if event_type == "updated" else "新资料")
-        description = briefs.feed_description(row_brief(row), row["url"] or None)
-        brief_label = (
-            "已整理为中文专业简报"
-            if "brief_status" in row.keys() and row["brief_status"] == "professional"
-            else "证据受限整理版（待专业回填）"
-        )
+        description = briefs.feed_description(professional_brief, row["url"] or None)
+        brief_label = "已整理为中文专业简报"
         ET.SubElement(item, "description").text = (
             f"{event_label} · {brief_label}\n\n{description}\n\n"
             "点击条目先看站内研究简报；原文入口位于简报末尾。"
@@ -1644,47 +1648,48 @@ def rss_xml(
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode")
 
 
-def archive_year(row: sqlite3.Row) -> str:
-    value = row["published_at"] or row["discovered_at"] or ""
-    match = re.match(r"^(\d{4})", value)
-    return match.group(1) if match else "unknown"
-
-
 def archive_feed_specs(rows: Sequence[sqlite3.Row]) -> List[Tuple[str, str, List[sqlite3.Row]]]:
-    by_year: Dict[str, List[sqlite3.Row]] = {}
+    """Return pre-created immutable hash buckets for one-time OPML import.
+
+    Year/chunk partitioning moves old records when a late paper is discovered
+    or its publication date is corrected. A canonical-key hash never changes,
+    so all bucket URLs can be subscribed on day one and every future item or
+    professional backfill lands in an already subscribed feed.
+    """
+
+    buckets: List[List[sqlite3.Row]] = [
+        [] for _ in range(ARCHIVE_BUCKET_COUNT)
+    ]
     for row in rows:
-        keys = set(row.keys())
-        # Historical baseline rows remain available while their professional
-        # backfill proceeds. A post-baseline item, or an existing item that has
-        # ever changed after baseline, is withheld from every subscribed
-        # archive until its current brief passes the professional gate. Looking
-        # only at delivered_at would leak legacy updates already acknowledged
-        # by an older release.
-        if "brief_status" in keys and row["brief_status"] != "professional":
-            is_baseline = bool(row["baseline"]) if "baseline" in keys else True
-            updated = int(row["update_event_count"] or 0) if "update_event_count" in keys else 0
-            if not is_baseline or updated:
-                continue
-        by_year.setdefault(archive_year(row), []).append(row)
-    years = sorted(
-        by_year,
-        key=lambda year: (year == "unknown", -int(year) if year.isdigit() else 0),
-    )
-    specs: List[Tuple[str, str, List[sqlite3.Row]]] = []
-    for year in years:
-        # Oldest-first chunking keeps completed chunks stable as a year grows.
-        ordered = sorted(
-            by_year[year],
-            key=lambda row: (row["published_at"] or row["discovered_at"] or "", int(row["id"])),
+        if (
+            "brief_status" not in row.keys()
+            or row["brief_status"] != "professional"
+        ):
+            continue
+        stable_key = (
+            str(row["canonical_key"])
+            if "canonical_key" in row.keys() and row["canonical_key"]
+            else str(row["id"])
         )
-        chunks = [ordered[index:index + MAX_FEED_ITEMS] for index in range(0, len(ordered), MAX_FEED_ITEMS)]
-        for number, chunk in enumerate(chunks, start=1):
-            suffix = "" if number == 1 else f"-{number}"
-            filename = f"archive-{year}{suffix}.xml"
-            label = f"SSD Research Radar 历史归档 · {year}"
-            if len(chunks) > 1:
-                label += f" · 第 {number} 卷"
-            specs.append((filename, label, chunk))
+        digest = hashlib.sha256(stable_key.encode("utf-8")).digest()
+        bucket = int.from_bytes(digest[:4], "big") % ARCHIVE_BUCKET_COUNT
+        buckets[bucket].append(row)
+
+    specs: List[Tuple[str, str, List[sqlite3.Row]]] = []
+    for number, bucket in enumerate(buckets, start=1):
+        ordered = sorted(
+            bucket,
+            key=lambda row: (
+                row["published_at"] or row["discovered_at"] or "",
+                int(row["id"]),
+            ),
+        )
+        filename = f"professional-archive-{number:02d}.xml"
+        label = (
+            "SSD Research Radar 专业简报历史"
+            f" · 固定分片 {number:02d}/{ARCHIVE_BUCKET_COUNT}"
+        )
+        specs.append((filename, label, ordered))
     return specs
 
 
@@ -1707,7 +1712,7 @@ def opml_xml(
         "xmlUrl": public_site_url("live.xml", base),
         "htmlUrl": base,
     })
-    archive_group = ET.SubElement(body, "outline", {"text": "SSD 历史归档（建议关闭通知）", "title": "SSD 历史归档（建议关闭通知）"})
+    archive_group = ET.SubElement(body, "outline", {"text": "SSD 专业简报历史（自动回填，建议关闭通知）", "title": "SSD 专业简报历史（自动回填，建议关闭通知）"})
     for filename, label, _rows in archive_specs:
         ET.SubElement(archive_group, "outline", {
             "text": label,
@@ -1749,16 +1754,16 @@ def opml_import_html(archive_count: int, *, base_url: Optional[str] = None) -> s
   <main>
     <div class="eyebrow">NETNEWSWIRE · OPML</div>
     <h1>下载后导入，不需要阅读 XML</h1>
-    <p>OPML 是订阅清单，不是普通网页。它包含一个实时更新 Feed 和 {archive_count} 个历史归档 Feed。</p>
+    <p>OPML 是订阅清单，不是普通网页。它包含一个实时更新 Feed 和 {archive_count} 个固定的专业简报历史 Feed。</p>
     <a class="button" href="{opml_url}" download="SSD-Research-Radar.opml">下载 UTF-8 OPML 文件</a>
     <a class="secondary" href="{live_url}">只订阅后续更新 →</a>
     <ol>
       <li>在 iPhone 或 iPad 上把下载文件存入“文件”App。</li>
       <li>打开 NetNewsWire：Settings → Import Subscriptions。</li>
       <li>选择刚下载的 <strong>SSD-Research-Radar.opml</strong>。</li>
-      <li>只给“SSD 即时更新”文件夹开启通知；历史归档保持关闭。</li>
+      <li>只给“SSD 即时更新”文件夹开启通知；历史简报保持关闭通知。</li>
     </ol>
-    <aside>如果浏览器仍显示 XML，长按“下载”按钮并选择“下载链接文件”；XML 页面本身不是报错。</aside>
+    <aside>历史资料只有完成专业整理并通过证据校验后才会出现在这些固定 Feed 中；后台回填时会自动增加。若你导入过旧版“SSD 历史归档”，请先删除那个旧文件夹，再导入本文件一次，以清除阅读器缓存；此后无需再次导入。若浏览器显示 XML，长按“下载”按钮并选择“下载链接文件”。</aside>
   </main>
 </body>
 </html>
@@ -1814,7 +1819,11 @@ def write_mobile_feeds(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) ->
             SITE_DIR / filename,
             rss_xml(chunk, feed_path=filename, channel_title=label, base_url=base, archive=True),
         )
-    for stale in SITE_DIR.glob("archive-*.xml"):
+    stale_archives = {
+        *SITE_DIR.glob("archive-*.xml"),
+        *SITE_DIR.glob("professional-archive-*.xml"),
+    }
+    for stale in stale_archives:
         if stale.name not in expected:
             stale.unlink()
     # GitHub Pages serves .opml as text/x-opml without a charset. A UTF-8 BOM
@@ -2012,6 +2021,21 @@ def report_payload(
         WHERE e.delivered_at IS NULL AND COALESCE(b.status,'fallback')!='professional'
         """
     ).fetchone()[0]
+    brief_counts = conn.execute(
+        """
+        SELECT COUNT(*) AS total,
+               SUM(CASE WHEN status='professional' THEN 1 ELSE 0 END) AS professional,
+               SUM(CASE WHEN status='retry' THEN 1 ELSE 0 END) AS retry
+        FROM item_briefs
+        """
+    ).fetchone()
+    total_items = int(brief_counts["total"] or 0)
+    professional_items = int(brief_counts["professional"] or 0)
+    retry_items = int(brief_counts["retry"] or 0)
+    backfill_percent = round(
+        (professional_items * 100.0 / total_items) if total_items else 100.0,
+        2,
+    )
     combined_warnings = list(warnings or [])
     if awaiting_briefs:
         combined_warnings.append(f"{awaiting_briefs} 条新增/更新正在等待专业简报，生成成功前不会推送")
@@ -2026,6 +2050,11 @@ def report_payload(
         "failures": failures,
         "warnings": combined_warnings,
         "awaiting_brief_count": int(awaiting_briefs),
+        "total_item_count": total_items,
+        "professional_brief_count": professional_items,
+        "pending_history_brief_count": total_items - professional_items,
+        "retry_brief_count": retry_items,
+        "backfill_percent": backfill_percent,
         "archive_path": str(SITE_DIR / "index.html"),
         "database_path": str(DB_PATH),
         "checked_at": iso(utcnow()),
@@ -2164,6 +2193,17 @@ def run_sync(force_full: bool = False, report_format: str = "markdown", max_repo
                 retry_after_seconds=brief_retry_seconds,
                 time_budget_seconds=max(
                     1, int(os.environ.get("RADAR_BRIEF_TIME_BUDGET", "300") or 300)
+                ),
+                request_interval_seconds=max(
+                    0.0,
+                    float(os.environ.get("RADAR_BRIEF_REQUEST_INTERVAL", "0") or 0),
+                ),
+                max_requests=max(
+                    1, int(os.environ.get("RADAR_BRIEF_MAX_REQUESTS", "60") or 60)
+                ),
+                max_input_tokens=max(
+                    1_000,
+                    int(os.environ.get("RADAR_BRIEF_MAX_INPUT_TOKENS", "7000") or 7000),
                 ),
             )
             if brief_result["failed"]:
@@ -2321,11 +2361,7 @@ def command_doctor(_args: argparse.Namespace) -> int:
             baseline_publishable = conn.execute(
                 """
                 SELECT COUNT(*) FROM items i JOIN item_briefs b ON b.item_id=i.id
-                WHERE i.baseline=1
-                  AND (b.status='professional' OR NOT EXISTS(
-                        SELECT 1 FROM run_events e
-                        WHERE e.item_id=i.id AND e.event_type='updated'
-                  ))
+                WHERE i.baseline=1 AND b.status='professional'
                 """
             ).fetchone()[0]
             professional_events = conn.execute(
@@ -2351,7 +2387,7 @@ def command_doctor(_args: argparse.Namespace) -> int:
     else:
         problems.append("netnewswire.opml 尚未生成")
     archived_items = 0
-    for archive_feed in SITE_DIR.glob("archive-*.xml"):
+    for archive_feed in SITE_DIR.glob("professional-archive-*.xml"):
         try:
             root = ET.parse(archive_feed).getroot()
             count = sum(1 for node in root.iter() if xml_local_name(node.tag) == "item")

@@ -6,7 +6,7 @@ import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from unittest import mock
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlsplit
 
 import radar
 
@@ -15,11 +15,12 @@ def mark_professional(connection, item_id=None):
     where = " WHERE item_id=?" if item_id is not None else ""
     parameters = (item_id,) if item_id is not None else ()
     for row in connection.execute(
-        "SELECT b.item_id,b.source_hash,b.brief_json,i.summary "
+        "SELECT b.item_id,b.source_hash,b.brief_json,i.title,i.summary "
         "FROM item_briefs b JOIN items i ON i.id=b.item_id" + where.replace("item_id", "b.item_id"),
         parameters,
     ).fetchall():
         content = json.loads(row["brief_json"])
+        content["title_zh"] = f"中文：{row['title']}"
         if row["summary"]:
             content["evidence_level"] = "source_summary"
             content["system_layers"] = ["NAND"]
@@ -496,6 +497,11 @@ class RadarUnitTests(unittest.TestCase):
         second_run = conn.execute("INSERT INTO runs(started_at,status) VALUES('two','running')").lastrowid
         payload = radar.report_payload(conn, second_run, [])
         self.assertEqual(payload["new_count"], 1)
+        self.assertEqual(payload["total_item_count"], 1)
+        self.assertEqual(payload["professional_brief_count"], 1)
+        self.assertEqual(payload["pending_history_brief_count"], 0)
+        self.assertEqual(payload["retry_brief_count"], 0)
+        self.assertEqual(payload["backfill_percent"], 100.0)
         conn.execute("UPDATE run_events SET delivered_at='now' WHERE delivered_at IS NULL")
         self.assertEqual(radar.report_payload(conn, second_run, [])["new_count"], 0)
 
@@ -522,11 +528,17 @@ class RadarUnitTests(unittest.TestCase):
         )
         self.assertEqual(conn.execute("SELECT summary FROM items").fetchone()[0], "New NAND summary with corrected findings")
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM item_versions").fetchone()[0], 2)
+        radar.briefs.ensure_fallback_briefs(conn)
+        item_id = conn.execute("SELECT id FROM items").fetchone()[0]
+        mark_professional(conn, item_id)
         rows = conn.execute(
-            "SELECT i.*,e.run_id,e.event_type,e.created_at AS event_created_at FROM run_events e JOIN items i ON i.id=e.item_id WHERE e.event_type='updated'"
+            "SELECT i.*,b.public_id,b.status AS brief_status,b.brief_json,"
+            "e.run_id,e.event_type,e.created_at AS event_created_at "
+            "FROM run_events e JOIN items i ON i.id=e.item_id "
+            "JOIN item_briefs b ON b.item_id=i.id WHERE e.event_type='updated'"
         ).fetchall()
         feed = radar.rss_xml(rows)
-        self.assertIn("[更新] Versioned NAND Paper", feed)
+        self.assertIn("[更新] 中文：Versioned NAND Paper", feed)
         self.assertIn(":updated", feed)
 
     def test_delivered_baseline_update_is_withheld_and_requeued_until_professional(self):
@@ -653,35 +665,102 @@ class RadarUnitTests(unittest.TestCase):
             live_root = ET.parse(site / "live.xml").getroot()
             self.assertEqual(live_root.findtext("channel/ttl"), "15")
             live_items = [node for node in live_root.iter() if radar.xml_local_name(node.tag) == "item"]
-            self.assertEqual([node.findtext("title") for node in live_items], ["Future live item"])
+            self.assertEqual(
+                [node.findtext("title") for node in live_items],
+                ["中文：Future live item"],
+            )
+            live_link = live_items[0].findtext("link") or ""
+            self.assertTrue(
+                live_link.startswith("https://reader.example/ssd-radar/item.html?id=")
+            )
+            live_public_id = parse_qs(urlsplit(live_link).query)["id"][0]
+            self.assertTrue(
+                (site / "items" / live_public_id[:2] / f"{live_public_id}.json").is_file()
+            )
             atom = {"atom": "http://www.w3.org/2005/Atom"}
             self_link = live_root.find("channel/atom:link[@rel='self']", atom)
             hub_link = live_root.find("channel/atom:link[@rel='hub']", atom)
             self.assertEqual(self_link.attrib["href"], "https://reader.example/ssd-radar/live.xml")
             self.assertEqual(hub_link.attrib["href"], "https://hub.example/publish")
-            archive_files = sorted(site.glob("archive-*.xml"))
-            self.assertEqual([path.name for path in archive_files], ["archive-2026-2.xml", "archive-2026.xml"])
+            archive_files = sorted(site.glob("professional-archive-*.xml"))
+            self.assertEqual(
+                len(archive_files), radar.ARCHIVE_BUCKET_COUNT
+            )
+            self.assertEqual(archive_files[0].name, "professional-archive-01.xml")
+            self.assertEqual(archive_files[-1].name, "professional-archive-32.xml")
             archive_counts = [
                 sum(1 for node in ET.parse(path).getroot().iter() if radar.xml_local_name(node.tag) == "item")
                 for path in archive_files
             ]
-            self.assertEqual(sorted(archive_counts), [2, 350])
+            self.assertEqual(sum(archive_counts), 1)
+            self.assertEqual(max(archive_counts), 1)
             archived_titles = [
                 node.findtext("title")
                 for path in archive_files
                 for node in ET.parse(path).getroot().findall("channel/item")
             ]
+            self.assertEqual(archived_titles, ["中文：Future live item"])
             self.assertNotIn("Pending raw item", archived_titles)
+            archived_links = [
+                node.findtext("link") or ""
+                for path in archive_files
+                for node in ET.parse(path).getroot().findall("channel/item")
+            ]
+            self.assertEqual(len(archived_links), 1)
+            self.assertTrue(
+                archived_links[0].startswith(
+                    "https://reader.example/ssd-radar/item.html?id="
+                )
+            )
             opml_bytes = (site / "netnewswire.opml").read_bytes()
             self.assertTrue(opml_bytes.startswith(b"\xef\xbb\xbf<?xml"))
             opml = ET.parse(site / "netnewswire.opml").getroot()
             urls = [node.attrib["xmlUrl"] for node in opml.iter("outline") if "xmlUrl" in node.attrib]
             self.assertEqual(urls[0], "https://reader.example/ssd-radar/live.xml")
-            self.assertIn("https://reader.example/ssd-radar/archive-2026.xml", urls)
+            self.assertIn(
+                "https://reader.example/ssd-radar/professional-archive-01.xml",
+                urls,
+            )
+            self.assertIn(
+                "https://reader.example/ssd-radar/professional-archive-32.xml",
+                urls,
+            )
+            self.assertEqual(len(urls), radar.ARCHIVE_BUCKET_COUNT + 1)
             import_page = (site / "import.html").read_text(encoding="utf-8")
             self.assertIn('<meta charset="utf-8">', import_page)
             self.assertIn('download="SSD-Research-Radar.opml"', import_page)
             self.assertIn("https://reader.example/ssd-radar/netnewswire.opml", import_page)
+
+            pending_catalogue = json.loads(
+                (site / "archive.json").read_text(encoding="utf-8")
+            )
+            pending_entry = next(
+                item for item in pending_catalogue["items"]
+                if item["title"] == "Pending raw item"
+            )
+            self.assertNotEqual(pending_entry["brief_status"], "professional")
+
+            baseline_id = conn.execute(
+                "SELECT id FROM items WHERE title='Baseline item 000'"
+            ).fetchone()[0]
+            mark_professional(conn, baseline_id)
+            radar.build_site(conn)
+            self.assertEqual(
+                [path.name for path in sorted(site.glob("professional-archive-*.xml"))],
+                [
+                    f"professional-archive-{number:02d}.xml"
+                    for number in range(1, radar.ARCHIVE_BUCKET_COUNT + 1)
+                ],
+            )
+            backfilled_titles = [
+                node.findtext("title")
+                for path in sorted(site.glob("professional-archive-*.xml"))
+                for node in ET.parse(path).getroot().findall("channel/item")
+            ]
+            self.assertCountEqual(
+                backfilled_titles,
+                ["中文：Baseline item 000", "中文：Future live item"],
+            )
         conn.close()
 
     def test_websub_failure_keeps_event_pending_then_success_acknowledges(self):
@@ -694,8 +773,8 @@ class RadarUnitTests(unittest.TestCase):
         )
         item_id = conn.execute(
             """
-            INSERT INTO items(canonical_key,item_type,title,normalized_title,topics_json,discovered_at,updated_at,baseline)
-            VALUES('x','paper','X','x','[]','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',0)
+            INSERT INTO items(canonical_key,item_type,title,normalized_title,summary,topics_json,discovered_at,updated_at,baseline)
+            VALUES('x','paper','X','x','NAND evidence sentence.','[]','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z',0)
             """
         ).lastrowid
         run_id = conn.execute("INSERT INTO runs(started_at,status) VALUES('now','ok')").lastrowid

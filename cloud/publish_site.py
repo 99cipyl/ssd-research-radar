@@ -115,8 +115,11 @@ def add_feed_item(
     event_created_at: Optional[str] = None,
     base_url: str,
 ) -> None:
+    if row["brief_status"] != "professional":
+        raise ValueError("feed rows must have a validated professional brief")
+    brief = briefs.parse_brief(row["brief_json"])
     item = ET.SubElement(channel, "item")
-    title = row["title"]
+    title = brief["title_zh"]
     if event_type == "updated":
         title = "[更新] " + title
     add_text(item, "title", title)
@@ -132,17 +135,7 @@ def add_feed_item(
         "new": "新资料",
         "updated": "已有资料发生实质更新",
     }.get(event_type, "历史资料")
-    try:
-        if row["brief_status"] != "professional":
-            raise ValueError("brief is not professional")
-        brief = briefs.parse_brief(row["brief_json"])
-    except (TypeError, ValueError):
-        brief = briefs.fallback_brief(row)
-    brief_label = (
-        "已整理为中文专业简报"
-        if row["brief_status"] == "professional"
-        else "证据受限整理版（待专业回填）"
-    )
+    brief_label = "已整理为中文专业简报"
     parts = [event_label + " · " + brief_label, "", briefs.feed_description(brief, row["url"])]
     parts.extend(("", "点击条目先看站内简报；原文入口位于简报内。"))
     add_text(item, "description", "\n".join(parts))
@@ -157,14 +150,7 @@ def build_full_feed(database: Path, destination: Path, base_url: str) -> int:
             """
             SELECT i.*,b.brief_json,b.status AS brief_status
             FROM items i JOIN item_briefs b ON b.item_id=i.id
-            WHERE i.baseline=1
-              AND (
-                    b.status='professional'
-                    OR NOT EXISTS(
-                        SELECT 1 FROM run_events pending
-                        WHERE pending.item_id=i.id AND pending.event_type='updated'
-                    )
-                  )
+            WHERE i.baseline=1 AND b.status='professional'
             ORDER BY COALESCE(published_at,discovered_at) DESC,id DESC
             """
         ).fetchall()
@@ -182,12 +168,12 @@ def build_full_feed(database: Path, destination: Path, base_url: str) -> int:
 
     root = ET.Element("rss", {"version": "2.0"})
     channel = ET.SubElement(root, "channel")
-    add_text(channel, "title", "SSD Research Radar｜完整历史与后续更新")
+    add_text(channel, "title", "SSD Research Radar｜专业简报历史与后续更新")
     add_text(channel, "link", base_url)
     add_text(
         channel,
         "description",
-        "首次订阅可读取当前完整历史；以后继续接收新增资料和实质更新。",
+        "只发布已经完成中文专业整理并通过证据校验的历史、新增资料和实质更新；待整理历史会在合格后自动出现。",
     )
     add_text(channel, "language", "zh-CN")
     add_text(channel, "lastBuildDate", email.utils.format_datetime(dt.datetime.now(UTC)))
@@ -222,8 +208,8 @@ def build_full_feed(database: Path, destination: Path, base_url: str) -> int:
 
 def build_opml(destination: Path, base_url: str, generated_opml: Optional[Path] = None) -> None:
     # radar.py already emits the preferred NetNewsWire layout: one live feed
-    # plus year/chunk archives capped at 350 items. Keep subscriptions.opml as
-    # a compatibility alias instead of collapsing the history into a single
+    # plus pre-created stable hash buckets. Keep subscriptions.opml as a
+    # compatibility alias instead of collapsing the history into a single
     # 2,900+ item feed that server readers may truncate.
     if generated_opml and generated_opml.is_file():
         shutil.copyfile(generated_opml, destination)
@@ -236,8 +222,8 @@ def build_opml(destination: Path, base_url: str, generated_opml: Optional[Path] 
         body,
         "outline",
         {
-            "text": "SSD Research Radar｜完整历史与后续更新",
-            "title": "SSD Research Radar｜完整历史与后续更新",
+            "text": "SSD Research Radar｜专业简报历史与后续更新",
+            "title": "SSD Research Radar｜专业简报历史与后续更新",
             "type": "rss",
             "xmlUrl": urllib.parse.urljoin(base_url, "full.xml"),
             "htmlUrl": base_url,
@@ -257,6 +243,13 @@ def build_status(report_path: Path, destination: Path) -> None:
         "new_count": int(report.get("new_count", 0)),
         "updated_count": int(report.get("updated_count", 0)),
         "awaiting_brief_count": int(report.get("awaiting_brief_count", 0)),
+        "total_item_count": int(report.get("total_item_count", 0)),
+        "professional_brief_count": int(report.get("professional_brief_count", 0)),
+        "pending_history_brief_count": int(
+            report.get("pending_history_brief_count", 0)
+        ),
+        "retry_brief_count": int(report.get("retry_brief_count", 0)),
+        "backfill_percent": float(report.get("backfill_percent", 0.0)),
         "initialized": report.get("initialized", []),
         "failures": [
             {
@@ -281,7 +274,7 @@ def inject_subscription_links(index_path: Path, base_url: str) -> None:
     if "application/rss+xml" not in text:
         text = text.replace("</head>", alternate + "\n</head>", 1)
     banner = (
-        '<p><a href="full.xml" style="color:#fff;font-weight:700">订阅完整历史 + 后续更新 RSS</a>'
+        '<p><a href="full.xml" style="color:#fff;font-weight:700">订阅专业简报历史 + 后续更新 RSS</a>'
         '　·　<a href="import.html" style="color:#d8ebe2">导入 NetNewsWire OPML</a></p>'
     )
     marker = "</header>"

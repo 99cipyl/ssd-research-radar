@@ -9,7 +9,7 @@ radar into a public, mobile-friendly service for the expected repository
 After GitHub Pages is enabled with **Source: GitHub Actions**:
 
 - Dashboard: `https://99cipyl.github.io/ssd-research-radar/`
-- Recommended NetNewsWire feed: `https://99cipyl.github.io/ssd-research-radar/full.xml`
+- Recommended NetNewsWire feed: `https://99cipyl.github.io/ssd-research-radar/full.xml`（只含通过证据校验的专业简报）
 - Recent new/update events only: `https://99cipyl.github.io/ssd-research-radar/feed.xml`
 - NetNewsWire live + chunked-history OPML: `https://99cipyl.github.io/ssd-research-radar/netnewswire.opml`
 - Compatibility OPML alias: `https://99cipyl.github.io/ssd-research-radar/subscriptions.opml`
@@ -18,13 +18,15 @@ After GitHub Pages is enabled with **Source: GitHub Actions**:
 
 Subscribe to `live.xml` for daily updates, and import `netnewswire.opml` once
 when the historical archive is wanted. The OPML contains the live feed plus
-year/chunk archive feeds, each capped at 350 items. `full.xml` remains an
-optional machine-readable export of the whole archive, but server-side readers
-may truncate a single feed that large.
+32 immutable hash-bucket archive feeds. Their URLs are pre-created and a
+canonical item never changes bucket; only professionally validated rows are
+emitted. This lets one import receive later discoveries and backfill without
+another OPML import. `full.xml` is the single-feed professional export, but
+server-side readers may truncate it as it grows.
 
 Each RSS item links to the local Chinese brief first; the original source is a
-separate button inside that page. New/update events are withheld from every
-subscribed feed until a validated professional brief exists. Each professional
+separate button inside that page. Historical, new, and updated items are all
+withheld from every subscribed feed until a validated professional brief exists. Each professional
 brief includes an exact short supporting quote, explicit evidence level, model,
 generation time, and an AI-not-human-reviewed label. The public feeds advertise
 a Google WebSub hub, which the workflow pings only after Pages deployment. Server-side readers that
@@ -35,10 +37,14 @@ their next polling cycle.
 
 The workflow checks the RSS/WordPress/specification sources at minutes 07, 22,
 37, and 52 of every hour. FAST and OpenAlex are checked once daily because they
-are slower academic indexes rather than immediate announcement feeds, and they
-receive an explicit full rescan on the first day of each month. A manual run
-or a relevant `main`-branch source/configuration push checks every source. A
-single concurrency group prevents overlapping syncs.
+are slower academic indexes rather than immediate announcement feeds. On the
+first day of each month, the explicit `--full` job enables only FAST and replays
+its bounded TOC set. OpenAlex performs an initial historical baseline and then
+uses a rolling one-year daily search; its 25-year keyword history is not replayed
+monthly because a late free-quota 429 would discard the whole fetched batch. A
+manual run or a relevant `main`-branch source/configuration push checks every
+source while likewise suppressing an automatic OpenAlex full replay. A single
+concurrency group prevents overlapping syncs.
 
 The durable database is stored in the orphan `radar-state` branch. Runtime-only
 changes such as `last_attempt_at`, `last_success_at`, empty `runs`, and delivery
@@ -59,10 +65,12 @@ persisted before deployment, so the event is not silently discarded.
 
 ## Optional secrets
 
-The workflow works without user-created secrets and uses each source's documented public
-fallback. Add these repository Actions secrets when available:
+The non-OpenAlex sources retain documented public fallbacks without
+user-created secrets. Add these repository Actions secrets when available:
 
-- `OPENALEX_API_KEY`: improves OpenAlex quota and reliability.
+- `OPENALEX_API_KEY`: strongly recommended for OpenAlex quota and reliability;
+  without it, an OpenAlex poll may be rate-limited while the other sources keep
+  running.
 - `GROUPS_IO_API_KEY`: enables the complete OCP Storage Groups.io history;
   without it, OCP falls back to the latest 20 public RSS messages and continues
   accumulating future messages.
@@ -73,10 +81,13 @@ to the site, report, state branch, or logs by the cloud helper scripts.
 Professional summaries use the job's short-lived built-in `GITHUB_TOKEN` with
 the workflow's `models: read` permission and the `openai/gpt-4.1-mini` GitHub
 Models endpoint. Manual runs backfill 12 recent historical items; the daily
-academic and monthly runs each backfill 24. Live events are attempted first,
-at most 12 per run, and do not count against those history limits. Failed items
-wait six hours before retry, and one run spends at most five minutes scheduling
-model work.
+academic run backfills up to 120 within a 20-minute model budget. Frequent and
+monthly runs set the historical backfill limit to zero, so the monthly FAST
+rescan does not duplicate the daily academic model batch. Live events are
+attempted first, at most 12 per run, and do not count against those history
+limits. Failed items wait six hours before retry. Frequent, manual, and monthly
+runs spend at most five minutes scheduling model work; only the daily academic
+historical backfill may spend up to twenty minutes.
 
 ## Timing limits
 
@@ -94,5 +105,6 @@ This is near-real-time RSS, not a hard real-time push system:
 
 The initial cloud run has no state branch, so it performs the full baseline and
 can be much slower than later runs. That baseline is deliberately not emitted as
-thousands of "new" events; it is instead present as the historical portion of
-`full.xml` and in the searchable dashboard.
+thousands of "new" events. The complete catalogue remains searchable on the
+dashboard; each historical item enters `full.xml` and its fixed archive feed
+only after the professional brief passes validation.

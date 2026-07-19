@@ -371,7 +371,7 @@ const render = (data, selectedEvent) => {
   text("limitations", brief.limitations);
   const evidenceLabels = {
     official_fulltext: "官方网页正文（专业模型整理；未核验 PDF 全文）",
-    official_excerpt: "官方网页正文节选（专业模型仅读取前 12,000 字；未核验 PDF 全文）",
+    official_excerpt: "官方网页正文节选（专业模型仅基于节选整理；未核验 PDF 全文）",
     official_abstract: "官方摘要或官方元数据（专业模型整理）",
     source_summary: "来源摘要 / 正文摘录（专业模型整理）",
     none: "仅题名与元数据；不推断论文结论"

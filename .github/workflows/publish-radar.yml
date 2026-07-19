@@ -117,13 +117,29 @@ jobs:
           RADAR_BRIEF_MODEL: openai/gpt-4.1-mini
           RADAR_BRIEF_BATCH_SIZE: 2
           RADAR_BRIEF_TIME_BUDGET: 300
+          RADAR_BRIEF_REQUEST_INTERVAL: 4.2
+          RADAR_BRIEF_MAX_REQUESTS: 60
+          RADAR_BRIEF_MAX_INPUT_TOKENS: 7000
           RADAR_SYNC_MODE: ${{ steps.mode.outputs.mode }}
         run: |
           set +e
           case "$RADAR_SYNC_MODE" in
-            manual) export RADAR_BRIEF_HISTORY_LIMIT=12 ;;
-            academic) export RADAR_BRIEF_HISTORY_LIMIT=24 ;;
-            monthly) export RADAR_BRIEF_HISTORY_LIMIT=24 ;;
+            manual)
+              export RADAR_BRIEF_HISTORY_LIMIT=12
+              # A source-code push is also the controlled repair path. Retry
+              # validation failures immediately after prompt/validator fixes;
+              # scheduled runs retain the normal six-hour backoff.
+              export RADAR_BRIEF_RETRY_SECONDS=0
+              ;;
+            academic)
+              export RADAR_BRIEF_HISTORY_LIMIT=120
+              export RADAR_BRIEF_TIME_BUDGET=1200
+              ;;
+            monthly)
+              # The daily academic job owns historical brief backfill. Avoid a
+              # second large model batch on the first day of each month.
+              export RADAR_BRIEF_HISTORY_LIMIT=0
+              ;;
             *) export RADAR_BRIEF_HISTORY_LIMIT=0 ;;
           esac
           args=(sync --format json)
@@ -198,7 +214,6 @@ jobs:
         with:
           path: site
           retention-days: 1
-          include-hidden-files: true
 
   deploy:
     needs: sync-and-build

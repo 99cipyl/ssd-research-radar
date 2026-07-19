@@ -200,6 +200,20 @@ class ItemPageExportTests(unittest.TestCase):
             self.assertIn('"?event=" + encodeURIComponent(selectedEvent)', page)
             self.assertIn('href="https://reader.example/ssd-radar/"', page)
             self.assertIn("核心思想的原文依据", page)
+            for heading in (
+                "内容是什么",
+                "要解决的问题",
+                "核心思想",
+                "机制 / 怎么做",
+                "证据 / 结果",
+                "位于 SSD 全链路哪一层",
+                "与你的工程工作有什么关系",
+                "怎么读最划算",
+                "局限与阅读边界",
+                "证据等级",
+            ):
+                self.assertIn(heading, page)
+            self.assertIn("阅读原文", page)
             self.assertIn("整理模型：", page)
             self.assertIn("生成时间：", page)
             self.assertIn("AI 自动整理完成 · 未经人工全文复核", page)

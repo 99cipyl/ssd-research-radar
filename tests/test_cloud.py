@@ -61,24 +61,30 @@ class CloudPublishingTests(unittest.TestCase):
                 )
         connection.commit()
         briefs.ensure_fallback_briefs(connection)
-        row = connection.execute(
-            "SELECT item_id,brief_json FROM item_briefs WHERE item_id=(SELECT id FROM items WHERE baseline=0)"
-        ).fetchone()
-        professional = json.loads(row["brief_json"])
-        professional["evidence_level"] = "source_summary"
-        professional["supporting_quote"] = "A source abstract that must not become the feed link."
+        rows = connection.execute(
+            "SELECT item_id,source_hash,brief_json FROM item_briefs ORDER BY item_id"
+        ).fetchall()
         model = "test"
-        validation_hash = briefs.professional_validation_hash(
+        for row in rows:
+            professional = json.loads(row["brief_json"])
+            professional["title_zh"] = f"中文：Paper {row['item_id']}"
+            professional["evidence_level"] = "source_summary"
+            professional["supporting_quote"] = (
+                "A source abstract that must not become the feed link."
+            )
+            validation_hash = briefs.professional_validation_hash(
+                row["source_hash"], model, professional
+            )
             connection.execute(
-                "SELECT source_hash FROM item_briefs WHERE item_id=?", (row["item_id"],)
-            ).fetchone()[0],
-            model,
-            professional,
-        )
-        connection.execute(
-            "UPDATE item_briefs SET status='professional',model=?,brief_json=?,validation_hash=? WHERE item_id=?",
-            (model, json.dumps(professional, ensure_ascii=False), validation_hash, row["item_id"]),
-        )
+                "UPDATE item_briefs SET status='professional',model=?,brief_json=?,"
+                "validation_hash=? WHERE item_id=?",
+                (
+                    model,
+                    json.dumps(professional, ensure_ascii=False),
+                    validation_hash,
+                    row["item_id"],
+                ),
+            )
         connection.commit()
         return connection
 
@@ -129,7 +135,28 @@ class CloudPublishingTests(unittest.TestCase):
             )
             self.assertEqual(count, 1)
             titles = [node.findtext("title") for node in ET.parse(destination).findall("channel/item")]
-            self.assertEqual(titles, ["Paper 1"])
+            self.assertEqual(titles, ["中文：Paper 1"])
+
+    def test_unprofessional_untouched_baseline_is_withheld_from_full_feed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "radar.sqlite3"
+            connection = self.database(database)
+            connection.execute(
+                "UPDATE item_briefs SET status='retry',model=NULL "
+                "WHERE item_id=(SELECT id FROM items WHERE baseline=1)"
+            )
+            connection.commit()
+            connection.close()
+            destination = Path(directory) / "full.xml"
+            count = publish_site.build_full_feed(
+                database, destination, "https://reader.example/radar/"
+            )
+            self.assertEqual(count, 1)
+            titles = [
+                node.findtext("title")
+                for node in ET.parse(destination).findall("channel/item")
+            ]
+            self.assertEqual(titles, ["中文：Paper 2"])
 
     def test_brief_content_is_material_but_retry_bookkeeping_is_not(self):
         with tempfile.TemporaryDirectory() as directory:
