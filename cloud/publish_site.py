@@ -11,10 +11,19 @@ import html
 import json
 import shutil
 import sqlite3
+import sys
 import urllib.parse
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional, Sequence
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import briefs
+import item_page
 
 
 ATOM = "http://www.w3.org/2005/Atom"
@@ -69,12 +78,12 @@ def rewrite_live_feed(path: Path, base_url: str) -> None:
     link_node.text = base_url
     description = channel.find("description")
     if description is not None:
-        description.text = "SSD / NAND / NVMe 新增与实质更新（最近 200 个事件）"
+        description.text = "SSD / NAND / NVMe 新增与实质更新（最近 350 个事件）"
     ttl = channel.find("ttl")
     if ttl is None:
         ttl = ET.SubElement(channel, "ttl")
     ttl.text = "15"
-    feed_url = urllib.parse.urljoin(base_url, "feed.xml")
+    feed_url = urllib.parse.urljoin(base_url, "live.xml")
     add_discovery_links(channel, feed_url)
     for item in channel.findall("item"):
         link = item.find("link")
@@ -104,13 +113,17 @@ def add_feed_item(
     guid: str,
     event_type: Optional[str] = None,
     event_created_at: Optional[str] = None,
+    base_url: str,
 ) -> None:
     item = ET.SubElement(channel, "item")
     title = row["title"]
     if event_type == "updated":
         title = "[更新] " + title
     add_text(item, "title", title)
-    add_text(item, "link", row["url"])
+    event = None
+    if event_type:
+        event = f"{row['run_id']}:{row['id']}:{event_type}"
+    add_text(item, "link", item_page.item_page_url(row["canonical_key"], base_url, event))
     guid_node = ET.SubElement(item, "guid", {"isPermaLink": "false"})
     guid_node.text = guid
     date = event_created_at or row["published_at"] or row["discovered_at"]
@@ -119,12 +132,19 @@ def add_feed_item(
         "new": "新资料",
         "updated": "已有资料发生实质更新",
     }.get(event_type, "历史资料")
-    parts = [event_label]
-    if row["summary"]:
-        parts.extend(("", row["summary"]))
-    topics = topic_text(row["topics_json"])
-    if topics:
-        parts.extend(("", f"主题：{topics}"))
+    try:
+        if row["brief_status"] != "professional":
+            raise ValueError("brief is not professional")
+        brief = briefs.parse_brief(row["brief_json"])
+    except (TypeError, ValueError):
+        brief = briefs.fallback_brief(row)
+    brief_label = (
+        "已整理为中文专业简报"
+        if row["brief_status"] == "professional"
+        else "证据受限整理版（待专业回填）"
+    )
+    parts = [event_label + " · " + brief_label, "", briefs.feed_description(brief, row["url"])]
+    parts.extend(("", "点击条目先看站内简报；原文入口位于简报内。"))
     add_text(item, "description", "\n".join(parts))
 
 
@@ -132,16 +152,28 @@ def build_full_feed(database: Path, destination: Path, base_url: str) -> int:
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
     try:
+        briefs.validate_professional_briefs(connection)
         baseline_rows = connection.execute(
             """
-            SELECT * FROM items WHERE baseline=1
+            SELECT i.*,b.brief_json,b.status AS brief_status
+            FROM items i JOIN item_briefs b ON b.item_id=i.id
+            WHERE i.baseline=1
+              AND (
+                    b.status='professional'
+                    OR NOT EXISTS(
+                        SELECT 1 FROM run_events pending
+                        WHERE pending.item_id=i.id AND pending.event_type='updated'
+                    )
+                  )
             ORDER BY COALESCE(published_at,discovered_at) DESC,id DESC
             """
         ).fetchall()
         event_rows = connection.execute(
             """
-            SELECT i.*,e.run_id,e.event_type,e.created_at AS event_created_at
+            SELECT i.*,b.brief_json,b.status AS brief_status,
+                   e.run_id,e.event_type,e.created_at AS event_created_at
             FROM run_events e JOIN items i ON i.id=e.item_id
+            JOIN item_briefs b ON b.item_id=i.id AND b.status='professional'
             ORDER BY e.created_at DESC,e.run_id DESC,i.id DESC
             """
         ).fetchall()
@@ -171,10 +203,16 @@ def build_full_feed(database: Path, destination: Path, base_url: str) -> int:
             guid=f"urn:ssd-research-radar:event:{row['run_id']}:{row['id']}:{row['event_type']}",
             event_type=row["event_type"],
             event_created_at=row["event_created_at"],
+            base_url=base_url,
         )
     for row in baseline_rows:
         stable = hashlib.sha256(row["canonical_key"].encode("utf-8")).hexdigest()
-        add_feed_item(channel, row, guid=f"urn:ssd-research-radar:item:{stable}")
+        add_feed_item(
+            channel,
+            row,
+            guid=f"urn:ssd-research-radar:item:{stable}",
+            base_url=base_url,
+        )
 
     ET.indent(root, space="  ")
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -218,6 +256,7 @@ def build_status(report_path: Path, destination: Path) -> None:
         "checked_at": report.get("checked_at"),
         "new_count": int(report.get("new_count", 0)),
         "updated_count": int(report.get("updated_count", 0)),
+        "awaiting_brief_count": int(report.get("awaiting_brief_count", 0)),
         "initialized": report.get("initialized", []),
         "failures": [
             {
@@ -266,7 +305,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not args.database.is_file():
         raise FileNotFoundError(args.database)
     args.site.mkdir(parents=True, exist_ok=True)
-    rewrite_live_feed(args.site / "feed.xml", base_url)
+    rewrite_live_feed(args.site / "live.xml", base_url)
+    # Keep the long-standing feed.xml subscription as a byte-for-byte alias;
+    # the canonical WebSub topic remains live.xml.
+    shutil.copyfile(args.site / "live.xml", args.site / "feed.xml")
     count = build_full_feed(args.database, args.site / "full.xml", base_url)
     build_opml(
         args.site / "subscriptions.opml",

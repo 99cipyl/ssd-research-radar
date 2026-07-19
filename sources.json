@@ -20,17 +20,14 @@
     {
       "id": "nvmw_official",
       "name": "NVMW Official",
-      "kind": "page",
+      "kind": "nvmw",
       "category": "NVMW / 前沿会议",
       "homepage": "https://nvmw.ucsd.edu/",
       "endpoint": "https://nvmw.ucsd.edu/",
-      "title": "NVMW Official Program & Announcements",
-      "authors": "Non-Volatile Memories Workshop",
-      "follow_link_patterns": [
-        "program"
-      ],
-      "max_followed_pages": 2,
-      "fetch_revision": 2,
+      "follow_link_patterns": ["program"],
+      "max_followed_pages": 1,
+      "rebaseline_revision": 1,
+      "fetch_revision": 3,
       "minimum_interval_hours": 6,
       "enabled": true
     },
@@ -66,11 +63,13 @@
     {
       "id": "nvm_express_specs",
       "name": "NVM Express 规范页",
-      "kind": "wordpress_page",
+      "kind": "nvme_specs",
       "category": "NVMe / 标准",
       "homepage": "https://nvmexpress.org/specifications/",
-      "endpoint": "https://nvmexpress.org/wp-json/wp/v2/pages/4457",
-      "title": "NVM Express Specifications",
+      "endpoint": "https://nvmexpress.org/wp-json/vtm/v1/specifications",
+      "rebaseline_revision": 1,
+      "fetch_revision": 2,
+      "minimum_interval_hours": 6,
       "enabled": true
     },
     {

@@ -15,6 +15,7 @@ import email.utils
 import fcntl
 import hashlib
 import html
+import http.client
 import json
 import os
 import re
@@ -33,6 +34,9 @@ from html.parser import HTMLParser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+
+import briefs
+import item_page
 
 
 ROOT = Path(__file__).resolve().parent
@@ -148,6 +152,70 @@ class TextExtractor(HTMLParser):
 
     def handle_data(self, data: str) -> None:
         self.parts.append(data)
+
+
+class NVMWProgramParser(HTMLParser):
+    """Extract the self-contained talk popups from the official NVMW program."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.talks: List[Dict[str, Any]] = []
+        self.current: Optional[Dict[str, Any]] = None
+        self.div_depth = 0
+        self.capture_title = False
+        self.capture_authors = False
+
+    def handle_starttag(self, tag: str, attrs: List[Tuple[str, Optional[str]]]) -> None:
+        values = {key.casefold(): value or "" for key, value in attrs}
+        if tag.casefold() == "div":
+            classes = set(values.get("class", "").casefold().split())
+            if self.current is None and "nmw-popup" in classes:
+                self.current = {
+                    "id": values.get("id", "").strip(),
+                    "parts": [],
+                    "title_parts": [],
+                    "author_parts": [],
+                    "links": [],
+                }
+                self.div_depth = 1
+                return
+            if self.current is not None:
+                self.div_depth += 1
+        if self.current is None:
+            return
+        lowered = tag.casefold()
+        if lowered == "h3" and not self.current["title_parts"]:
+            self.capture_title = True
+        if lowered == "span" and "nvmw-author-list" in values.get("class", "").casefold().split():
+            self.capture_authors = True
+        if lowered == "a" and values.get("href"):
+            self.current["links"].append(values["href"])
+
+    def handle_endtag(self, tag: str) -> None:
+        if self.current is None:
+            return
+        lowered = tag.casefold()
+        if lowered == "h3":
+            self.capture_title = False
+        elif lowered == "span":
+            self.capture_authors = False
+        if lowered == "div":
+            self.div_depth -= 1
+            if self.div_depth <= 0:
+                self.talks.append(self.current)
+                self.current = None
+                self.div_depth = 0
+                self.capture_title = False
+                self.capture_authors = False
+
+    def handle_data(self, data: str) -> None:
+        if self.current is None:
+            return
+        self.current["parts"].append(data)
+        if self.capture_title:
+            self.current["title_parts"].append(data)
+        if self.capture_authors:
+            self.current["author_parts"].append(data)
 
 
 def utcnow() -> dt.datetime:
@@ -319,6 +387,7 @@ def connect() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
+    briefs.ensure_schema(conn)
     # Existing installations created before periodic full rescans need a tiny
     # forward-only migration.  Treat the last successful baseline as a full
     # scan so upgrading does not immediately repeat a costly OpenAlex import.
@@ -359,6 +428,20 @@ def register_sources(conn: sqlite3.Connection, config: Dict[str, Any]) -> None:
     for source in config["sources"]:
         if not source.get("enabled", True):
             continue
+        config_json = json.dumps(source, ensure_ascii=False)
+        previous = conn.execute("SELECT config_json FROM sources WHERE id=?", (source["id"],)).fetchone()
+        previous_config: Dict[str, Any] = {}
+        if previous:
+            try:
+                previous_config = json.loads(previous["config_json"] or "{}")
+            except (TypeError, ValueError):
+                previous_config = {}
+        # Rebaselining is an explicit, monotonic migration revision.  A
+        # permanent boolean would silently suppress legitimate future program
+        # years whenever an unrelated source option changed.
+        previous_revision = int(previous_config.get("rebaseline_revision", 0) or 0)
+        current_revision = int(source.get("rebaseline_revision", 0) or 0)
+        rebaseline = bool(previous and current_revision > previous_revision)
         conn.execute(
             """
             INSERT INTO sources(id, name, kind, category, homepage, endpoint, config_json)
@@ -373,11 +456,12 @@ def register_sources(conn: sqlite3.Connection, config: Dict[str, Any]) -> None:
                     WHEN sources.config_json <> excluded.config_json THEN NULL
                     ELSE sources.last_success_at
                 END,
+                initialized=CASE WHEN ? THEN 0 ELSE sources.initialized END,
                 config_json=excluded.config_json
             """,
             (
                 source["id"], source["name"], source["kind"], source["category"],
-                source["homepage"], source["endpoint"], json.dumps(source, ensure_ascii=False),
+                source["homepage"], source["endpoint"], config_json, int(rebaseline),
             ),
         )
     conn.commit()
@@ -418,7 +502,7 @@ def request_bytes(
                 time.sleep(min(delay, 20))
                 continue
             raise
-        except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead) as exc:
             last_error = exc
             if attempt + 1 < retries:
                 time.sleep(2 ** attempt)
@@ -643,6 +727,163 @@ def fetch_page(source: Dict[str, Any], _full: bool, _since: Optional[str]) -> Li
     }]
 
 
+def parse_nvmw_program(content: str, page_url: str) -> List[Dict[str, Any]]:
+    """Turn one NVMW program page into independently trackable technical talks."""
+
+    parser = NVMWProgramParser()
+    parser.feed(content)
+    parser.close()
+    records: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for talk in parser.talks:
+        paper_id = str(talk.get("id") or "").strip()
+        title = strip_html(" ".join(talk.get("title_parts") or []))
+        text = strip_html(" ".join(talk.get("parts") or []))
+        if not paper_id or not title or paper_id in seen:
+            continue
+        seen.add(paper_id)
+        abstract_match = re.search(r"(?:^|\s)Abstract\s*:\s*(.+)$", text, flags=re.I | re.S)
+        abstract = abstract_match.group(1).strip() if abstract_match else ""
+        # Some popups contain download labels after the abstract. Keep the
+        # paper's prose, but do not let UI boilerplate dominate the evidence.
+        abstract = re.split(r"\s+(?:Download|Extended Abstract)\s*:?\s*", abstract, maxsplit=1, flags=re.I)[0]
+        authors = strip_html(" ".join(talk.get("author_parts") or [])).strip(" ;,")
+        links = [
+            normalize_url(urllib.parse.urljoin(page_url, href))
+            for href in talk.get("links") or []
+            if href and not str(href).startswith("#")
+        ]
+        records.append({
+            "external_id": paper_id,
+            "item_type": "paper",
+            "title": title,
+            "url": f"{page_url.rstrip('/')}#{urllib.parse.quote(paper_id)}",
+            "doi": None,
+            "authors": authors,
+            "venue": "Non-Volatile Memories Workshop (NVMW)",
+            "published_at": None,
+            "summary": abstract,
+            "content_fingerprint": hashlib.sha256(
+                json.dumps({"abstract": abstract, "links": links}, ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest(),
+            "raw": {"paper_id": paper_id, "links": links},
+        })
+    return records
+
+
+def fetch_nvmw(source: Dict[str, Any], _full: bool, _since: Optional[str]) -> List[Dict[str, Any]]:
+    """Discover the current official Program and expose each talk as one item."""
+
+    endpoint = str(source["endpoint"])
+    if "/wp-json/" in urllib.parse.urlsplit(endpoint).path:
+        page, _ = request_json(endpoint)
+    else:
+        homepage_data, _ = request_bytes(
+            endpoint, {"Accept": "text/html,application/xhtml+xml"}
+        )
+        homepage_text = homepage_data.decode("utf-8", "replace")
+        candidates = followed_page_urls(source, homepage_text)
+        program_url = candidates[0] if candidates else source.get("program_page_url")
+        if not program_url:
+            raise RuntimeError("NVMW homepage did not advertise a current Program page")
+        program_parts = urllib.parse.urlsplit(str(program_url))
+        slug = program_parts.path.rstrip("/").rsplit("/", 1)[-1]
+        if not slug:
+            raise RuntimeError("NVMW Program URL has no WordPress slug")
+        origin = urllib.parse.urlunsplit(
+            (program_parts.scheme, program_parts.netloc, "", "", "")
+        )
+        api_url = origin + "/wp-json/wp/v2/pages?" + urllib.parse.urlencode(
+            {
+                "slug": slug,
+                "_fields": "id,date_gmt,modified_gmt,link,title,content",
+            }
+        )
+        payload, _ = request_json(api_url)
+        page = payload[0] if isinstance(payload, list) and payload else payload
+    if not isinstance(page, dict):
+        raise RuntimeError("NVMW Program REST response was not a page object")
+    content = (page.get("content") or {}).get("rendered") or ""
+    page_url = normalize_url(page.get("link") or source.get("homepage") or source["endpoint"])
+    records = parse_nvmw_program(str(content), page_url or source["endpoint"])
+    # A WordPress layout edit changes modified_gmt for every talk.  The stable
+    # page publication date plus each talk's own content fingerprint prevents
+    # an unrelated edit from manufacturing a whole-program update flood.
+    published = parse_datetime(page.get("date_gmt"))
+    program_title = strip_html((page.get("title") or {}).get("rendered"))
+    year_match = re.search(r"\b(20\d{2})\b", program_title)
+    program_year = year_match.group(1) if year_match else (published or "")[:4]
+    program_id = str(page.get("id") or urllib.parse.urlsplit(page_url or "").path)
+    for record in records:
+        record["external_id"] = f"{program_id}:{program_year}:{record['external_id']}"
+        record["published_at"] = published
+        record["venue"] = f"{source.get('name') or record['venue']} {program_year}".strip()
+    if not records:
+        raise RuntimeError("NVMW program REST page contained no nmw-popup talks")
+    return records
+
+
+def fetch_nvme_specifications(
+    source: Dict[str, Any], _full: bool, _since: Optional[str]
+) -> List[Dict[str, Any]]:
+    """Split the official NVM Express specifications API into versioned items."""
+
+    payload, _ = request_json(source["endpoint"])
+    posts = payload.get("posts") if isinstance(payload, dict) else payload
+    if not isinstance(posts, list):
+        raise RuntimeError("NVM Express specifications API returned no posts list")
+    records: List[Dict[str, Any]] = []
+    for post in posts:
+        if not isinstance(post, dict):
+            continue
+        title = strip_html(post.get("post_title"))
+        if not title:
+            continue
+        file_info = post.get("file") if isinstance(post.get("file"), dict) else {}
+        spec_types = post.get("type") if isinstance(post.get("type"), list) else []
+        type_names = [strip_html(value.get("name")) for value in spec_types if isinstance(value, dict)]
+        description = strip_html(post.get("post_content") or post.get("post_excerpt"))
+        version_title = strip_html(file_info.get("title"))
+        summary_parts = [description]
+        if version_title:
+            summary_parts.append(f"Current official file: {version_title}.")
+        if type_names:
+            summary_parts.append("Specification categories: " + ", ".join(filter(None, type_names)) + ".")
+        file_url = normalize_url(file_info.get("url"))
+        records.append({
+            "external_id": str(post.get("id") or post.get("ID") or post.get("slug") or title),
+            "item_type": "standard",
+            "title": title,
+            "url": normalize_url(post.get("href")) or file_url or source.get("homepage"),
+            "doi": None,
+            "authors": "NVM Express",
+            "venue": source.get("name") or "NVM Express Specifications",
+            "published_at": parse_datetime(post.get("post_modified_gmt") or post.get("post_date_gmt")),
+            "summary": " ".join(part for part in summary_parts if part),
+            "content_fingerprint": hashlib.sha256(
+                json.dumps(
+                    {
+                        "post_modified_gmt": post.get("post_modified_gmt"),
+                        "file_id": file_info.get("id") or file_info.get("ID"),
+                        "file_url": file_url,
+                        "description": description,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest(),
+            "raw": {
+                "post_id": post.get("id") or post.get("ID"),
+                "file_id": file_info.get("id") or file_info.get("ID"),
+                "file_url": file_url,
+                "types": list(filter(None, type_names)),
+            },
+        })
+    if not records:
+        raise RuntimeError("NVM Express specifications API returned no usable specifications")
+    return records
+
+
 def fetch_wordpress_page(source: Dict[str, Any], _full: bool, _since: Optional[str]) -> List[Dict[str, Any]]:
     page, _ = request_json(source["endpoint"])
     title = strip_html((page.get("title") or {}).get("rendered")) or source.get("title") or "Page update"
@@ -699,6 +940,10 @@ def fetch_wordpress(source: Dict[str, Any], full: bool, since: Optional[str]) ->
                 "venue": source["name"],
                 "published_at": parse_datetime(post.get("date_gmt")),
                 "summary": excerpt,
+                # WordPress can materially change a post while leaving its
+                # short excerpt untouched.  The detail-page evidence and
+                # professional brief must then be regenerated.
+                "content_fingerprint": str(post.get("modified_gmt") or ""),
                 "raw": post,
             }
             records.append(record)
@@ -907,6 +1152,8 @@ FETCHERS = {
     "rss": fetch_rss,
     "groupsio": fetch_groupsio,
     "page": fetch_page,
+    "nvmw": fetch_nvmw,
+    "nvme_specs": fetch_nvme_specifications,
     "wordpress_page": fetch_wordpress_page,
     "openalex": fetch_openalex,
 }
@@ -961,7 +1208,11 @@ def ingest_record(
     now = iso(utcnow())
     record["title"] = strip_html(record.get("title")) or "(untitled)"
     record["summary"] = strip_html(record.get("summary"))
-    record["url"] = normalize_url(record.get("url"))
+    raw_url = str(record.get("url") or "")
+    raw_fragment = urllib.parse.urlsplit(raw_url).fragment
+    record["url"] = normalize_url(raw_url)
+    if source.get("kind") == "nvmw" and raw_fragment and record["url"]:
+        record["url"] += "#" + urllib.parse.quote(raw_fragment, safe="-._~")
     record["doi"] = normalize_doi(record.get("doi"))
     record["published_at"] = parse_datetime(record.get("published_at"))
     record["authors"] = strip_html(record.get("authors"))
@@ -1159,15 +1410,23 @@ def record_source_failure(conn: sqlite3.Connection, source_id: str, error: BaseE
 
 
 def item_rows(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    briefs.ensure_fallback_briefs(conn)
     return conn.execute(
         """
         SELECT i.*,
+               b.public_id,b.status AS brief_status,b.model AS brief_model,
+               b.brief_json,b.generated_at AS brief_generated_at,
                GROUP_CONCAT(DISTINCT s.name) AS source_names,
                GROUP_CONCAT(DISTINCT s.id) AS source_ids,
-               (SELECT COUNT(*) FROM item_versions v WHERE v.item_id=i.id) AS version_count
+               (SELECT COUNT(*) FROM item_versions v WHERE v.item_id=i.id) AS version_count,
+               (SELECT COUNT(*) FROM run_events e
+                WHERE e.item_id=i.id AND e.delivered_at IS NULL) AS pending_event_count,
+               (SELECT COUNT(*) FROM run_events e
+                WHERE e.item_id=i.id AND e.event_type='updated') AS update_event_count
         FROM items i
         JOIN item_sources x ON x.item_id=i.id
         JOIN sources s ON s.id=x.source_id
+        JOIN item_briefs b ON b.item_id=i.id
         GROUP BY i.id
         ORDER BY COALESCE(i.published_at,i.discovered_at) DESC, i.id DESC
         """
@@ -1235,7 +1494,7 @@ topics.forEach(x=>$('topic').insertAdjacentHTML('beforeend',`<option>${{esc(x)}}
 $('total').textContent=data.items.length; $('papers').textContent=data.items.filter(x=>x.item_type==='paper').length; const cutoff=Date.now()-30*864e5; $('recent').textContent=data.items.filter(x=>Date.parse(x.published_at)>=cutoff).length; $('healthy').textContent=data.sources.filter(x=>!x.last_error).length; $('generated').textContent=data.generated_at;
 $('status').innerHTML='<h3>来源状态</h3>'+data.sources.map(s=>`<div class="source"><b><a href="${{esc(s.homepage)}}" target="_blank" rel="noopener">${{esc(s.name)}}</a></b><div class="${{s.last_error?'bad':'ok'}}">${{s.last_error?'异常':'正常'}} · ${{s.item_count}} 条</div><div class="meta">最近成功：${{esc(s.last_success_at||'尚未同步')}}</div>${{s.last_error?`<div class="meta">${{esc(s.last_error)}}</div>`:''}}</div>`).join('');
 function filtered(){{const q=$('query').value.trim().toLowerCase(),t=$('topic').value,s=$('source').value,y=$('year').value;return data.items.filter(x=>(!q||`${{x.title}} ${{x.authors}} ${{x.summary}}`.toLowerCase().includes(q))&&(!t||x.topics.includes(t))&&(!s||x.source_ids.includes(s))&&(!y||(x.published_at||'').startsWith(y)));}}
-function render(){{const all=filtered(),pages=Math.max(1,Math.ceil(all.length/perPage));page=Math.min(page,pages);const slice=all.slice((page-1)*perPage,page*perPage);$('items').innerHTML=slice.length?slice.map(x=>`<article class="card"><h2><a href="${{esc(x.url||'#')}}" target="_blank" rel="noopener">${{esc(x.title)}}</a></h2><div class="meta">${{esc((x.published_at||'日期未知').slice(0,10))}} · ${{esc(x.source_names.join(' / '))}}${{x.venue?' · '+esc(x.venue):''}}${{x.authors?' · '+esc(x.authors):''}}</div>${{x.summary?`<p class="summary">${{esc(x.summary.slice(0,650))}}${{x.summary.length>650?'…':''}}</p>`:''}}<div class="chips">${{x.baseline?'':'<span class="chip new">新增</span>'}}${{x.version_count>1?`<span class="chip">${{x.version_count}} 个版本</span>`:''}}${{x.topics.map(t=>`<span class="chip">${{esc(t)}}</span>`).join('')}}</div></article>`).join(''):'<div class="card empty">没有匹配的资料</div>';$('page').textContent=`第 ${{page}} / ${{pages}} 页 · ${{all.length}} 条`;$('prev').disabled=page<=1;$('next').disabled=page>=pages;}}
+function render(){{const all=filtered(),pages=Math.max(1,Math.ceil(all.length/perPage));page=Math.min(page,pages);const slice=all.slice((page-1)*perPage,page*perPage);$('items').innerHTML=slice.length?slice.map(x=>`<article class="card"><h2><a href="${{esc(x.url||'#')}}" target="_blank" rel="noopener">${{esc(x.title)}}</a></h2><div class="meta">${{esc((x.published_at||'日期未知').slice(0,10))}} · ${{esc(x.source_names.join(' / '))}}${{x.venue?' · '+esc(x.venue):''}}${{x.authors?' · '+esc(x.authors):''}}</div>${{x.summary?`<p class="summary">${{esc(x.summary.slice(0,650))}}${{x.summary.length>650?'…':''}}</p>`:''}}<div class="chips">${{x.brief_status==='professional'?'<span class="chip">专业简报</span>':'<span class="chip new">证据受限</span>'}}${{x.baseline?'':'<span class="chip new">新增</span>'}}${{x.version_count>1?`<span class="chip">${{x.version_count}} 个版本</span>`:''}}${{x.system_layers.map(t=>`<span class="chip">${{esc(t)}}</span>`).join('')}}</div></article>`).join(''):'<div class="card empty">没有匹配的资料</div>';$('page').textContent=`第 ${{page}} / ${{pages}} 页 · ${{all.length}} 条`;$('prev').disabled=page<=1;$('next').disabled=page>=pages;}}
 ['query','topic','source','year'].forEach(id=>$(id).addEventListener(id==='query'?'input':'change',()=>{{page=1;render()}}));$('prev').onclick=()=>{{page--;render();scrollTo(0,0)}};$('next').onclick=()=>{{page++;render();scrollTo(0,0)}};render();
 </script>
 </body></html>"""
@@ -1260,6 +1519,46 @@ def configured_public_base_url() -> Optional[str]:
 
 def public_site_url(path: str = "", base_url: Optional[str] = None) -> str:
     return urllib.parse.urljoin(normalize_public_base_url(base_url), path.lstrip("/"))
+
+
+def row_brief(row: sqlite3.Row) -> Dict[str, Any]:
+    """Return a validated stored brief, or a strict evidence-only fallback."""
+
+    if (
+        "brief_status" in row.keys()
+        and row["brief_status"] == "professional"
+        and "brief_json" in row.keys()
+        and row["brief_json"]
+    ):
+        try:
+            return briefs.parse_brief(row["brief_json"])
+        except (TypeError, ValueError):
+            pass
+    # ``fallback_brief`` is public in briefs.py; getattr keeps upgrades from a
+    # development database safe if an older module is temporarily present.
+    fallback = getattr(briefs, "fallback_brief", None)
+    if fallback:
+        return fallback(row)
+    return briefs._fallback_brief(row)  # type: ignore[attr-defined]
+
+
+def row_public_id(row: sqlite3.Row) -> str:
+    if "public_id" in row.keys() and row["public_id"]:
+        return str(row["public_id"])
+    stable_key = row["canonical_key"] if "canonical_key" in row.keys() else str(row["id"])
+    return briefs.public_id(stable_key)
+
+
+def item_detail_url(
+    row: sqlite3.Row,
+    base_url: Optional[str] = None,
+    *,
+    event: Optional[str] = None,
+) -> str:
+    query = {"id": row_public_id(row)}
+    if event:
+        query["event"] = event
+    return public_site_url("item.html", base_url) + "?" + urllib.parse.urlencode(query)
 
 
 def validated_http_url(value: str, variable_name: str) -> str:
@@ -1308,7 +1607,11 @@ def rss_xml(
         item = ET.SubElement(channel, "item")
         prefix = "" if archive else ("[更新] " if event_type == "updated" else "")
         ET.SubElement(item, "title").text = prefix + row["title"]
-        ET.SubElement(item, "link").text = row["url"] or base
+        event_key = None
+        if not archive:
+            run_id = row["run_id"] if "run_id" in row.keys() else 0
+            event_key = f"{run_id}:{row['id']}:{event_type}"
+        ET.SubElement(item, "link").text = item_detail_url(row, base, event=event_key)
         guid = ET.SubElement(item, "guid", {"isPermaLink": "false"})
         if archive:
             stable_key = row["canonical_key"] if "canonical_key" in row.keys() else str(row["id"])
@@ -1326,10 +1629,17 @@ def rss_xml(
             ET.SubElement(item, "pubDate").text = email.utils.format_datetime(parsed)
         except Exception:
             pass
-        description = row["summary"] or ""
-        topics = ", ".join(json.loads(row["topics_json"] or "[]"))
         event_label = "历史资料" if archive else ("已有资料更新" if event_type == "updated" else "新资料")
-        ET.SubElement(item, "description").text = f"{event_label}\n\n{description}\n\n主题：{topics}"
+        description = briefs.feed_description(row_brief(row), row["url"] or None)
+        brief_label = (
+            "已整理为中文专业简报"
+            if "brief_status" in row.keys() and row["brief_status"] == "professional"
+            else "证据受限整理版（待专业回填）"
+        )
+        ET.SubElement(item, "description").text = (
+            f"{event_label} · {brief_label}\n\n{description}\n\n"
+            "点击条目先看站内研究简报；原文入口位于简报末尾。"
+        )
     ET.indent(root, space="  ")
     return '<?xml version="1.0" encoding="UTF-8"?>\n' + ET.tostring(root, encoding="unicode")
 
@@ -1343,6 +1653,18 @@ def archive_year(row: sqlite3.Row) -> str:
 def archive_feed_specs(rows: Sequence[sqlite3.Row]) -> List[Tuple[str, str, List[sqlite3.Row]]]:
     by_year: Dict[str, List[sqlite3.Row]] = {}
     for row in rows:
+        keys = set(row.keys())
+        # Historical baseline rows remain available while their professional
+        # backfill proceeds. A post-baseline item, or an existing item that has
+        # ever changed after baseline, is withheld from every subscribed
+        # archive until its current brief passes the professional gate. Looking
+        # only at delivered_at would leak legacy updates already acknowledged
+        # by an older release.
+        if "brief_status" in keys and row["brief_status"] != "professional":
+            is_baseline = bool(row["baseline"]) if "baseline" in keys else True
+            updated = int(row["update_event_count"] or 0) if "update_event_count" in keys else 0
+            if not is_baseline or updated:
+                continue
         by_year.setdefault(archive_year(row), []).append(row)
     years = sorted(
         by_year,
@@ -1444,11 +1766,16 @@ def opml_import_html(archive_count: int, *, base_url: Optional[str] = None) -> s
 
 
 def live_event_rows(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+    briefs.ensure_fallback_briefs(conn)
+    briefs.validate_professional_briefs(conn)
     pending = conn.execute(
         """
-        SELECT i.*,e.run_id,e.event_type,e.created_at AS event_created_at
+        SELECT i.*,b.public_id,b.status AS brief_status,b.model AS brief_model,
+               b.brief_json,b.generated_at AS brief_generated_at,
+               e.run_id,e.event_type,e.created_at AS event_created_at
         FROM run_events e JOIN items i ON i.id=e.item_id
-        WHERE e.websub_published_at IS NULL
+        JOIN item_briefs b ON b.item_id=i.id
+        WHERE e.websub_published_at IS NULL AND b.status='professional'
         ORDER BY e.created_at DESC,e.run_id DESC LIMIT ?
         """,
         (MAX_FEED_ITEMS,),
@@ -1457,8 +1784,11 @@ def live_event_rows(conn: sqlite3.Connection) -> List[sqlite3.Row]:
         return pending
     return conn.execute(
         """
-        SELECT i.*,e.run_id,e.event_type,e.created_at AS event_created_at
+        SELECT i.*,b.public_id,b.status AS brief_status,b.model AS brief_model,
+               b.brief_json,b.generated_at AS brief_generated_at,
+               e.run_id,e.event_type,e.created_at AS event_created_at
         FROM run_events e JOIN items i ON i.id=e.item_id
+        JOIN item_briefs b ON b.item_id=i.id AND b.status='professional'
         ORDER BY e.created_at DESC,e.run_id DESC LIMIT ?
         """,
         (MAX_FEED_ITEMS,),
@@ -1495,14 +1825,22 @@ def write_mobile_feeds(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) ->
 
 def build_site(conn: sqlite3.Connection) -> None:
     SITE_DIR.mkdir(parents=True, exist_ok=True)
+    briefs.ensure_fallback_briefs(conn)
+    briefs.validate_professional_briefs(conn)
     rows = item_rows(conn)
     sources = source_rows(conn)
     items: List[Dict[str, Any]] = []
     for row in rows:
+        brief = row_brief(row)
         items.append({
             "id": row["id"], "item_type": row["item_type"], "title": row["title"],
-            "url": row["url"], "doi": row["doi"], "authors": row["authors"], "venue": row["venue"],
-            "published_at": row["published_at"], "summary": row["summary"] or "",
+            "public_id": row_public_id(row),
+            "url": item_detail_url(row), "original_url": row["url"],
+            "doi": row["doi"], "authors": row["authors"], "venue": row["venue"],
+            "published_at": row["published_at"],
+            "summary": brief["one_liner"], "core_idea": brief["core_idea"],
+            "brief_status": row["brief_status"], "evidence_level": brief["evidence_level"],
+            "system_layers": brief["system_layers"],
             "topics": json.loads(row["topics_json"] or "[]"),
             "source_names": (row["source_names"] or "").split(","),
             "source_ids": (row["source_ids"] or "").split(","), "baseline": bool(row["baseline"]),
@@ -1513,6 +1851,7 @@ def build_site(conn: sqlite3.Connection) -> None:
         for row in sources
     ]
     generated = iso(utcnow())
+    item_page.export_item_pages(conn, SITE_DIR, normalize_public_base_url())
     atomically_write(SITE_DIR / "index.html", dashboard_html(items, source_payload, generated))
     write_mobile_feeds(conn, rows)
     archive = {
@@ -1557,6 +1896,8 @@ def publish_websub(hub_url: str, topic_url: str, retries: int = 3) -> None:
 
 def publish_pending_websub(conn: sqlite3.Connection) -> List[str]:
     """Publish one durable event batch; leave it pending if the hub fails."""
+    briefs.ensure_fallback_briefs(conn)
+    briefs.validate_professional_briefs(conn)
     hub = os.environ.get("RADAR_WEBSUB_HUB", "").strip()
     if not hub:
         return []
@@ -1566,8 +1907,8 @@ def publish_pending_websub(conn: sqlite3.Connection) -> List[str]:
     rows = conn.execute(
         """
         SELECT e.run_id,e.item_id,e.event_type
-        FROM run_events e
-        WHERE e.websub_published_at IS NULL
+        FROM run_events e JOIN item_briefs b ON b.item_id=e.item_id
+        WHERE e.websub_published_at IS NULL AND b.status='professional'
         ORDER BY e.created_at DESC,e.run_id DESC LIMIT ?
         """,
         (MAX_FEED_ITEMS,),
@@ -1598,15 +1939,38 @@ def publish_pending_websub(conn: sqlite3.Connection) -> List[str]:
 
 
 def pending_event_rows(conn: sqlite3.Connection, event_type: str) -> List[sqlite3.Row]:
+    briefs.ensure_fallback_briefs(conn)
+    briefs.validate_professional_briefs(conn)
     return conn.execute(
         """
-        SELECT i.*,s.name AS event_source
+        SELECT i.*,s.name AS event_source,b.public_id,b.status AS brief_status,
+               b.model AS brief_model,b.brief_json,b.generated_at AS brief_generated_at,
+               e.run_id,e.created_at AS event_created_at
         FROM run_events e JOIN items i ON i.id=e.item_id JOIN sources s ON s.id=e.source_id
-        WHERE e.delivered_at IS NULL AND e.event_type=?
+        JOIN item_briefs b ON b.item_id=i.id
+        WHERE e.delivered_at IS NULL AND e.event_type=? AND b.status='professional'
         ORDER BY COALESCE(i.published_at,i.discovered_at) DESC
         """,
         (event_type,),
     ).fetchall()
+
+
+def requeue_unprofessional_events(conn: sqlite3.Connection) -> int:
+    """Re-open legacy events that were acknowledged before brief gating existed."""
+
+    cursor = conn.execute(
+        """
+        UPDATE run_events
+        SET delivered_at=NULL,websub_published_at=NULL
+        WHERE EXISTS(
+            SELECT 1 FROM item_briefs b
+            WHERE b.item_id=run_events.item_id AND b.status!='professional'
+        )
+          AND (delivered_at IS NOT NULL OR websub_published_at IS NOT NULL)
+        """
+    )
+    conn.commit()
+    return max(0, int(cursor.rowcount))
 
 
 def report_payload(
@@ -1621,26 +1985,47 @@ def report_payload(
     new_rows = pending_event_rows(conn, "new")
     updated_rows = pending_event_rows(conn, "updated")
     failures = [result for result in source_results if not result.get("ok")]
+
+    def prepared_item(row: sqlite3.Row, event_type: str) -> Dict[str, Any]:
+        brief = row_brief(row)
+        event_key = f"{row['run_id']}:{row['id']}:{event_type}"
+        return {
+            "title": row["title"],
+            "url": item_detail_url(row, event=event_key),
+            "original_url": row["url"],
+            "published_at": row["published_at"],
+            "source": row["event_source"],
+            "authors": row["authors"],
+            "topics": json.loads(row["topics_json"] or "[]"),
+            "summary": brief["one_liner"],
+            "core_idea": brief["core_idea"],
+            "engineering_relevance": brief["engineering_relevance"],
+            "system_layers": brief["system_layers"],
+            "evidence_level": brief["evidence_level"],
+            "brief_status": row["brief_status"],
+        }
+
+    awaiting_briefs = conn.execute(
+        """
+        SELECT COUNT(*) FROM run_events e
+        LEFT JOIN item_briefs b ON b.item_id=e.item_id
+        WHERE e.delivered_at IS NULL AND COALESCE(b.status,'fallback')!='professional'
+        """
+    ).fetchone()[0]
+    combined_warnings = list(warnings or [])
+    if awaiting_briefs:
+        combined_warnings.append(f"{awaiting_briefs} 条新增/更新正在等待专业简报，生成成功前不会推送")
     return {
         "run_id": run_id,
         "ok": not failures,
         "initialized": [r["name"] for r in source_results if r.get("baseline") and r.get("ok")],
         "new_count": len(new_rows),
         "updated_count": len(updated_rows),
-        "new_items": [
-            {
-                "title": row["title"], "url": row["url"], "published_at": row["published_at"],
-                "source": row["event_source"], "authors": row["authors"],
-                "topics": json.loads(row["topics_json"] or "[]"), "summary": row["summary"] or "",
-            }
-            for row in new_rows
-        ],
-        "updated_items": [
-            {"title": row["title"], "url": row["url"], "source": row["event_source"]}
-            for row in updated_rows
-        ],
+        "new_items": [prepared_item(row, "new") for row in new_rows],
+        "updated_items": [prepared_item(row, "updated") for row in updated_rows],
         "failures": failures,
-        "warnings": warnings or [],
+        "warnings": combined_warnings,
+        "awaiting_brief_count": int(awaiting_briefs),
         "archive_path": str(SITE_DIR / "index.html"),
         "database_path": str(DB_PATH),
         "checked_at": iso(utcnow()),
@@ -1675,7 +2060,7 @@ def markdown_report(payload: Dict[str, Any], max_items: int = 30) -> str:
         for item in payload["updated_items"][:max_items]:
             lines.append(f"- [{item['title']}]({item.get('url') or ''}) — {item['source']}")
     if payload["failures"]:
-        lines.extend(["", "## 抓取异常"])
+        lines.extend(["", "## 同步或专业整理异常"])
         for failure in payload["failures"]:
             lines.append(f"- {failure['name']}: {failure['error']}")
     if payload.get("warnings"):
@@ -1737,9 +2122,84 @@ def run_sync(force_full: bool = False, report_format: str = "markdown", max_repo
             (iso(utcnow()), "ok" if not failed else "partial", successful, failed, new_count, updated_count, run_id),
         )
         conn.commit()
+        briefs.ensure_fallback_briefs(conn)
+        requeued_events = requeue_unprofessional_events(conn)
+        brief_retry_seconds = max(
+            0, int(os.environ.get("RADAR_BRIEF_RETRY_SECONDS", str(6 * 60 * 60)) or 0)
+        )
+        brief_retry_cutoff = iso(
+            utcnow() - dt.timedelta(seconds=brief_retry_seconds)
+        )
+        priority_item_ids = [
+            int(row[0])
+            for row in conn.execute(
+                """
+                SELECT e.item_id FROM run_events e
+                JOIN item_briefs b ON b.item_id=e.item_id
+                WHERE e.delivered_at IS NULL AND b.status!='professional'
+                  AND (b.status!='retry' OR b.last_attempt_at IS NULL OR b.last_attempt_at<=?)
+                GROUP BY e.item_id
+                ORDER BY MIN(e.created_at),e.item_id
+                LIMIT 12
+                """,
+                (brief_retry_cutoff,),
+            )
+        ]
+        brief_warnings: List[str] = []
+        if requeued_events:
+            brief_warnings.append(
+                f"{requeued_events} 条旧事件已重新进入专业简报门禁；整理完成前不会发布"
+            )
+        models_token = os.environ.get("GITHUB_MODELS_TOKEN", "").strip()
+        history_limit = max(0, int(os.environ.get("RADAR_BRIEF_HISTORY_LIMIT", "0") or 0))
+        if models_token:
+            brief_result = briefs.generate_professional_briefs(
+                conn,
+                models_token,
+                model=os.environ.get("RADAR_BRIEF_MODEL", briefs.DEFAULT_MODEL).strip()
+                or briefs.DEFAULT_MODEL,
+                priority_item_ids=priority_item_ids,
+                history_limit=history_limit,
+                batch_size=max(1, int(os.environ.get("RADAR_BRIEF_BATCH_SIZE", "4") or 4)),
+                retry_after_seconds=brief_retry_seconds,
+                time_budget_seconds=max(
+                    1, int(os.environ.get("RADAR_BRIEF_TIME_BUDGET", "300") or 300)
+                ),
+            )
+            if brief_result["failed"]:
+                brief_error = "; ".join(brief_result.get("errors") or ["unknown error"])
+                brief_warnings.append(
+                    f"专业简报生成失败 {brief_result['failed']} 条，已保留待下次自动重试："
+                    + brief_error
+                )
+                source_results.append(
+                    {
+                        "id": "brief_generation",
+                        "name": "专业简报生成",
+                        "ok": False,
+                        "error": f"{brief_result['failed']} 条失败：{brief_error}"[:1000],
+                    }
+                )
+                conn.execute(
+                    "UPDATE runs SET status='partial',failed_sources=failed_sources+1 WHERE id=?",
+                    (run_id,),
+                )
+                conn.commit()
+            if brief_result.get("deferred"):
+                brief_warnings.append(
+                    f"专业简报达到本轮时间预算，另有 {brief_result['deferred']} 条留待后续批次"
+                )
+        elif priority_item_ids:
+            brief_warnings.append(
+                f"{len(priority_item_ids)} 条新增/更新尚未生成专业简报；本机未配置 GitHub Models，"
+                "不会以原始摘录先行推送"
+            )
+        demoted = briefs.validate_professional_briefs(conn)
+        if demoted:
+            brief_warnings.append(f"发现 {demoted} 条旧专业简报结构失效，已停止发布并重新排队")
         build_site(conn)
         websub_warnings = publish_pending_websub(conn)
-        payload = report_payload(conn, run_id, source_results, websub_warnings)
+        payload = report_payload(conn, run_id, source_results, [*brief_warnings, *websub_warnings])
         report_text = markdown_report(payload, max_report_items)
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         stamp = utcnow().strftime("%Y-%m-%dT%H%M%SZ")
@@ -1749,7 +2209,14 @@ def run_sync(force_full: bool = False, report_format: str = "markdown", max_repo
         # files are durably replaced.  A crash between these two operations can
         # repeat a notification, but cannot lose one.
         conn.execute(
-            "UPDATE run_events SET delivered_at=? WHERE delivered_at IS NULL",
+            """
+            UPDATE run_events SET delivered_at=?
+            WHERE delivered_at IS NULL
+              AND EXISTS(
+                  SELECT 1 FROM item_briefs b
+                  WHERE b.item_id=run_events.item_id AND b.status='professional'
+              )
+            """,
             (iso(utcnow()),),
         )
         conn.commit()
@@ -1785,6 +2252,7 @@ def command_stats(_args: argparse.Namespace) -> int:
 def command_doctor(_args: argparse.Namespace) -> int:
     conn = connect()
     register_sources(conn, load_config())
+    briefs.validate_professional_briefs(conn)
     problems: List[str] = []
     integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
     if integrity != "ok":
@@ -1842,6 +2310,38 @@ def command_doctor(_args: argparse.Namespace) -> int:
             problems.append(f"live.xml: {exc}")
     else:
         problems.append("live.xml 尚未生成")
+    full_path = SITE_DIR / "full.xml"
+    if full_path.exists():
+        try:
+            full_count = sum(
+                1
+                for node in ET.parse(full_path).getroot().iter()
+                if xml_local_name(node.tag) == "item"
+            )
+            baseline_publishable = conn.execute(
+                """
+                SELECT COUNT(*) FROM items i JOIN item_briefs b ON b.item_id=i.id
+                WHERE i.baseline=1
+                  AND (b.status='professional' OR NOT EXISTS(
+                        SELECT 1 FROM run_events e
+                        WHERE e.item_id=i.id AND e.event_type='updated'
+                  ))
+                """
+            ).fetchone()[0]
+            professional_events = conn.execute(
+                """
+                SELECT COUNT(*) FROM run_events e
+                JOIN item_briefs b ON b.item_id=e.item_id
+                WHERE b.status='professional'
+                """
+            ).fetchone()[0]
+            expected_full = int(baseline_publishable) + int(professional_events)
+            if full_count != expected_full:
+                problems.append(
+                    f"full.xml 条目数与可发布资料不一致：{full_count} != {expected_full}"
+                )
+        except (ET.ParseError, OSError) as exc:
+            problems.append(f"full.xml: {exc}")
     opml_path = SITE_DIR / "netnewswire.opml"
     if opml_path.exists():
         try:
@@ -1860,8 +2360,14 @@ def command_doctor(_args: argparse.Namespace) -> int:
                 problems.append(f"{archive_feed.name}: {count} 条，超过 {MAX_FEED_ITEMS} 条上限")
         except (ET.ParseError, OSError) as exc:
             problems.append(f"{archive_feed.name}: {exc}")
-    if archived_items != db_count:
-        problems.append(f"历史 RSS 条目数与数据库不一致：{archived_items} != {db_count}")
+    expected_archived_items = sum(
+        len(chunk) for _filename, _label, chunk in archive_feed_specs(item_rows(conn))
+    )
+    if archived_items != expected_archived_items:
+        problems.append(
+            "历史 RSS 条目数与可发布资料不一致："
+            f"{archived_items} != {expected_archived_items}"
+        )
     conn.close()
     if problems:
         print("\n".join(problems))

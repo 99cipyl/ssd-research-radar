@@ -6,8 +6,12 @@ on:
     branches: [main]
     paths:
       - radar.py
+      - briefs.py
+      - evidence.py
+      - item_page.py
       - sources.json
       - cloud/**
+      - tests/**
       - .github/workflows/publish-radar.yml
   schedule:
     # Offset from the top of the hour because GitHub reports heavier queueing
@@ -25,13 +29,13 @@ concurrency:
 env:
   PUBLIC_BASE_URL: https://99cipyl.github.io/ssd-research-radar/
   RADAR_PUBLIC_BASE_URL: https://99cipyl.github.io/ssd-research-radar/
-  RADAR_WEBSUB_HUB: https://pubsubhubbub.appspot.com/
 
 jobs:
   sync-and-build:
     permissions:
       contents: write
       pages: write
+      models: read
     runs-on: ubuntu-latest
     timeout-minutes: 55
     env:
@@ -45,6 +49,11 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 1
+
+      - name: Run regression tests before touching production state
+        run: |
+          python3 -m unittest discover -s tests -q
+          python3 -m py_compile radar.py briefs.py evidence.py item_page.py cloud/*.py
 
       - name: Restore durable state branch
         id: restore
@@ -103,8 +112,20 @@ jobs:
       - name: Synchronize sources
         id: sync
         shell: bash
+        env:
+          GITHUB_MODELS_TOKEN: ${{ github.token }}
+          RADAR_BRIEF_MODEL: openai/gpt-4.1-mini
+          RADAR_BRIEF_BATCH_SIZE: 2
+          RADAR_BRIEF_TIME_BUDGET: 300
+          RADAR_SYNC_MODE: ${{ steps.mode.outputs.mode }}
         run: |
           set +e
+          case "$RADAR_SYNC_MODE" in
+            manual) export RADAR_BRIEF_HISTORY_LIMIT=12 ;;
+            academic) export RADAR_BRIEF_HISTORY_LIMIT=24 ;;
+            monthly) export RADAR_BRIEF_HISTORY_LIMIT=24 ;;
+            *) export RADAR_BRIEF_HISTORY_LIMIT=0 ;;
+          esac
           args=(sync --format json)
           if [[ "${{ steps.mode.outputs.full }}" == "true" ]]; then
             args+=(--full)
@@ -195,11 +216,9 @@ jobs:
         uses: actions/deploy-pages@v4
 
       - name: Check out notifier
-        if: needs.sync-and-build.outputs.state_changed == 'true'
         uses: actions/checkout@v6
 
-      - name: Notify WebSub hub after material feed change
-        if: needs.sync-and-build.outputs.state_changed == 'true'
+      - name: Notify WebSub hub after the deployed feeds are public
         continue-on-error: true
         run: |
           python3 cloud/notify_websub.py \

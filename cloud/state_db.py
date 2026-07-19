@@ -43,6 +43,43 @@ MATERIAL_QUERIES: Sequence[str] = (
     """,
 )
 
+BRIEF_QUERY = """
+    SELECT item_id,public_id,source_hash,
+           CASE WHEN status='professional' THEN 'professional' ELSE 'pending' END AS publication_status,
+           model,brief_json,generated_at,attempt_count,validation_hash
+    FROM item_briefs ORDER BY item_id
+"""
+
+
+def brief_material_query(connection: sqlite3.Connection) -> str:
+    columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(item_briefs)")
+    }
+    required = {
+        "item_id", "public_id", "source_hash", "status", "model", "brief_json",
+        "generated_at", "attempt_count", "validation_hash",
+    }
+    if required.issubset(columns):
+        return BRIEF_QUERY
+    # Forward-compatible read of an older state snapshot before radar.connect
+    # applies its schema migration. Missing fields deliberately alter the next
+    # post-migration fingerprint, ensuring the upgraded state is persisted.
+    expression = lambda name, fallback: name if name in columns else f"{fallback} AS {name}"
+    return "SELECT " + ",".join(
+        [
+            expression("item_id", "0"),
+            expression("public_id", "''"),
+            expression("source_hash", "''"),
+            "CASE WHEN status='professional' THEN 'professional' ELSE 'pending' END AS publication_status"
+            if "status" in columns else "'pending' AS publication_status",
+            expression("model", "NULL"),
+            expression("brief_json", "'{}'"),
+            expression("generated_at", "NULL"),
+            expression("attempt_count", "0"),
+            expression("validation_hash", "NULL"),
+        ]
+    ) + " FROM item_briefs ORDER BY item_id"
+
 
 def connect_readonly(path: Path) -> sqlite3.Connection:
     # ``mode=ro`` is attractive but some macOS SQLite builds cannot open a
@@ -90,7 +127,16 @@ def material_fingerprint(path: Path) -> str:
         if item_count == 0 and version_count == 0 and event_count == 0:
             return EMPTY_FINGERPRINT
         digest = hashlib.sha256()
-        for query in MATERIAL_QUERIES:
+        queries = list(MATERIAL_QUERIES)
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        if "item_briefs" in tables:
+            queries.append(brief_material_query(connection))
+        for query in queries:
             digest.update(b"\x1equery\x1f")
             for encoded in encoded_rows(connection.execute(query)):
                 digest.update(encoded)

@@ -11,6 +11,34 @@ from urllib.parse import parse_qs
 import radar
 
 
+def mark_professional(connection, item_id=None):
+    where = " WHERE item_id=?" if item_id is not None else ""
+    parameters = (item_id,) if item_id is not None else ()
+    for row in connection.execute(
+        "SELECT b.item_id,b.source_hash,b.brief_json,i.summary "
+        "FROM item_briefs b JOIN items i ON i.id=b.item_id" + where.replace("item_id", "b.item_id"),
+        parameters,
+    ).fetchall():
+        content = json.loads(row["brief_json"])
+        if row["summary"]:
+            content["evidence_level"] = "source_summary"
+            content["system_layers"] = ["NAND"]
+            content["supporting_quote"] = " ".join(str(row["summary"]).split()[:20])
+        else:
+            content["evidence_level"] = "none"
+            content["supporting_quote"] = "原页面未提供"
+            content["system_layers"] = ["待判定"]
+        model = "test-model"
+        validation_hash = radar.briefs.professional_validation_hash(
+            row["source_hash"], model, content
+        )
+        connection.execute(
+            "UPDATE item_briefs SET status='professional',model=?,brief_json=?,validation_hash=? WHERE item_id=?",
+            (model, json.dumps(content, ensure_ascii=False), validation_hash, row["item_id"]),
+        )
+    connection.commit()
+
+
 class RadarUnitTests(unittest.TestCase):
     @staticmethod
     def dblp_fixture_responses():
@@ -143,6 +171,130 @@ class RadarUnitTests(unittest.TestCase):
         self.assertEqual(row["initialized"], 1)
         self.assertIsNone(row["last_success_at"])
         conn.close()
+
+    def test_fetch_configuration_can_rebaseline_a_source_without_notification_flood(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(radar.SCHEMA)
+        source = {
+            "id": "nvmw_official", "name": "NVMW", "kind": "page", "category": "NVMW",
+            "homepage": "https://nvmw.example/", "endpoint": "https://nvmw.example/",
+        }
+        radar.register_sources(conn, {"sources": [source]})
+        conn.execute("UPDATE sources SET initialized=1,last_success_at='2026-01-01T00:00:00Z'")
+        conn.commit()
+        changed = dict(
+            source,
+            kind="nvmw",
+            endpoint="https://nvmw.example/wp-json/wp/v2/pages/1",
+            rebaseline_revision=1,
+        )
+        radar.register_sources(conn, {"sources": [changed]})
+        row = conn.execute("SELECT initialized,last_success_at FROM sources").fetchone()
+        self.assertEqual(row["initialized"], 0)
+        self.assertIsNone(row["last_success_at"])
+        conn.close()
+
+    def test_nvmw_program_is_split_into_independent_talks_with_abstracts(self):
+        content = """
+        <div class='nmw-popup' id='paper-7' style='display:none'>
+          <h3>Flash Translation at Scale</h3>
+          <p><span class='nvmw-author-list'>A. Engineer (Lab);</span></p>
+          <p><b>Abstract:</b> We reduce garbage-collection interference with host writes.</p>
+          <a href='/nvmw2026/final7.pdf'>Extended Abstract</a>
+        </div>
+        <div class='nmw-popup' id='paper-8'><h3>NAND Reliability</h3>
+          <p><b>Abstract:</b> We characterize retention and read disturb.</p></div>
+        """
+        rows = radar.parse_nvmw_program(content, "https://nvmw.example/program/")
+        self.assertEqual([row["external_id"] for row in rows], ["paper-7", "paper-8"])
+        self.assertEqual(rows[0]["title"], "Flash Translation at Scale")
+        self.assertEqual(rows[0]["authors"], "A. Engineer (Lab)")
+        self.assertIn("garbage-collection", rows[0]["summary"])
+        self.assertEqual(rows[0]["raw"]["links"], ["https://nvmw.example/nvmw2026/final7.pdf"])
+        self.assertNotEqual(rows[0]["content_fingerprint"], rows[1]["content_fingerprint"])
+
+    def test_nvmw_discovers_current_program_and_uses_stable_publish_date(self):
+        homepage = b"<a href='/program-4/'>Program (2027)</a>"
+        page = [{
+            "id": 5000,
+            "date_gmt": "2027-02-01 08:00:00",
+            "modified_gmt": "2027-07-19 12:00:00",
+            "link": "https://nvmw.ucsd.edu/program-4/",
+            "title": {"rendered": "Program NVMW 2027"},
+            "content": {"rendered": """
+                <div class='nmw-popup' id='paper-1'><h3>Future SSD</h3>
+                <p><b>Abstract:</b> A source-backed abstract.</p></div>
+            """},
+        }]
+        calls = []
+
+        def fake_json(url, *_args, **_kwargs):
+            calls.append(url)
+            return page, {}
+
+        source = {
+            "id": "nvmw_official", "name": "NVMW", "kind": "nvmw",
+            "endpoint": "https://nvmw.ucsd.edu/",
+            "follow_link_patterns": ["program"], "max_followed_pages": 1,
+        }
+        with mock.patch.object(radar, "request_bytes", return_value=(homepage, {})), mock.patch.object(
+            radar, "request_json", side_effect=fake_json
+        ):
+            rows = radar.fetch_nvmw(source, False, None)
+
+        self.assertEqual(len(rows), 1)
+        self.assertIn("slug=program-4", calls[0])
+        self.assertEqual(rows[0]["external_id"], "5000:2027:paper-1")
+        self.assertEqual(rows[0]["published_at"], "2027-02-01T08:00:00Z")
+        self.assertEqual(rows[0]["url"], "https://nvmw.ucsd.edu/program-4#paper-1")
+
+    def test_nvmw_ingest_preserves_talk_fragment(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(radar.SCHEMA)
+        conn.execute(
+            "INSERT INTO sources(id,name,kind,category,homepage,endpoint,config_json,initialized) VALUES(?,?,?,?,?,?,?,1)",
+            ("nvmw_official", "NVMW", "nvmw", "NVMW", "https://nvmw.example", "https://nvmw.example", "{}"),
+        )
+        run_id = conn.execute("INSERT INTO runs(started_at,status) VALUES('now','ok')").lastrowid
+        record = {
+            "external_id": "5000:2027:paper-1", "item_type": "paper", "title": "Future SSD",
+            "url": "https://nvmw.example/program/#paper-1", "summary": "NAND abstract",
+            "authors": "A", "venue": "NVMW 2027", "published_at": "2027-02-01",
+        }
+        radar.ingest_record(
+            conn, run_id,
+            {"id": "nvmw_official", "kind": "nvmw", "category": "NVMW"},
+            record, True,
+        )
+        self.assertEqual(
+            conn.execute("SELECT url FROM items").fetchone()[0],
+            "https://nvmw.example/program#paper-1",
+        )
+        conn.close()
+
+    def test_nvme_specifications_are_split_and_track_current_file(self):
+        payload = {
+            "posts": [{
+                "id": 42,
+                "post_title": "NVM Express Base Specification",
+                "post_content": "Defines the register interface and command architecture.",
+                "post_modified_gmt": "2026-07-01 10:00:00",
+                "href": "https://nvmexpress.example/specification/base/",
+                "file": {"id": 99, "title": "NVMe Base 2.3", "url": "https://nvmexpress.example/base-2.3.pdf"},
+                "type": [{"name": "Base"}],
+            }]
+        }
+        with mock.patch.object(radar, "request_json", return_value=(payload, {})):
+            rows = radar.fetch_nvme_specifications(
+                {"endpoint": "https://nvmexpress.example/api", "name": "NVMe specs"}, False, None
+            )
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["external_id"], "42")
+        self.assertIn("NVMe Base 2.3", rows[0]["summary"])
+        self.assertEqual(rows[0]["raw"]["file_id"], 99)
+        self.assertEqual(rows[0]["item_type"], "standard")
 
     def test_page_fingerprint_ignores_dynamic_markup_ids(self):
         source = {
@@ -339,6 +491,8 @@ class RadarUnitTests(unittest.TestCase):
             "venue": "V", "published_at": "2026-01-01", "summary": "NAND",
         }
         radar.ingest_record(conn, first_run, {"id": "a", "category": "paper"}, record, True)
+        radar.briefs.ensure_fallback_briefs(conn)
+        mark_professional(conn)
         second_run = conn.execute("INSERT INTO runs(started_at,status) VALUES('two','running')").lastrowid
         payload = radar.report_payload(conn, second_run, [])
         self.assertEqual(payload["new_count"], 1)
@@ -374,6 +528,45 @@ class RadarUnitTests(unittest.TestCase):
         feed = radar.rss_xml(rows)
         self.assertIn("[更新] Versioned NAND Paper", feed)
         self.assertIn(":updated", feed)
+
+    def test_delivered_baseline_update_is_withheld_and_requeued_until_professional(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(radar.SCHEMA)
+        conn.execute(
+            "INSERT INTO sources(id,name,kind,category,homepage,endpoint,config_json,initialized) VALUES('a','A','rss','paper','https://example.com','https://example.com/feed','{}',1)"
+        )
+        item_id = conn.execute(
+            """
+            INSERT INTO items(canonical_key,item_type,title,normalized_title,url,summary,
+                              topics_json,discovered_at,updated_at,baseline)
+            VALUES('legacy','paper','Legacy update','legacy update','https://example.com/x',
+                   'Updated NAND evidence','[]','2026-01-01T00:00:00Z','2026-07-19T00:00:00Z',1)
+            """
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO item_sources(source_id,external_id,item_id,source_url,raw_hash,first_seen_at,last_seen_at) VALUES('a','x',?,'https://example.com/x','hash','now','now')",
+            (item_id,),
+        )
+        run_id = conn.execute("INSERT INTO runs(started_at,status) VALUES('now','ok')").lastrowid
+        conn.execute(
+            "INSERT INTO run_events(run_id,item_id,source_id,event_type,created_at,delivered_at) VALUES(?,?,'a','updated','now','legacy-delivered')",
+            (run_id, item_id),
+        )
+        conn.commit()
+        radar.briefs.ensure_fallback_briefs(conn)
+        self.assertEqual(
+            sum(len(chunk) for _, _, chunk in radar.archive_feed_specs(radar.item_rows(conn))),
+            0,
+        )
+        self.assertEqual(radar.requeue_unprofessional_events(conn), 1)
+        self.assertIsNone(conn.execute("SELECT delivered_at FROM run_events").fetchone()[0])
+        mark_professional(conn, item_id)
+        self.assertEqual(
+            sum(len(chunk) for _, _, chunk in radar.archive_feed_specs(radar.item_rows(conn))),
+            1,
+        )
+        conn.close()
 
     def test_public_base_url_normalization(self):
         self.assertEqual(
@@ -425,6 +618,28 @@ class RadarUnitTests(unittest.TestCase):
                     (run_id, item_id, "a", "new", "2026-07-19T12:00:00Z"),
                 )
         conn.commit()
+        radar.briefs.ensure_fallback_briefs(conn)
+        mark_professional(conn, item_id)
+        pending_id = conn.execute(
+            """
+            INSERT INTO items(
+                canonical_key,item_type,title,normalized_title,url,published_at,summary,
+                topics_json,discovered_at,updated_at,baseline
+            ) VALUES('item:pending','paper','Pending raw item','pending raw item',
+                     'https://papers.example/pending','2026-01-01T00:00:00Z','Raw abstract',
+                     '[]','2026-07-19T00:00:00Z','2026-07-19T00:00:00Z',0)
+            """
+        ).lastrowid
+        conn.execute(
+            "INSERT INTO item_sources(source_id,external_id,item_id,source_url,raw_hash,first_seen_at,last_seen_at) VALUES('a','pending',?,'https://papers.example/pending','pending','now','now')",
+            (pending_id,),
+        )
+        conn.execute(
+            "INSERT INTO run_events(run_id,item_id,source_id,event_type,created_at) VALUES(?,?,'a','new','2026-07-19T12:01:00Z')",
+            (run_id, pending_id),
+        )
+        conn.commit()
+        radar.briefs.ensure_fallback_briefs(conn)
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(radar, "SITE_DIR", Path(directory)), mock.patch.dict(
             os.environ,
             {
@@ -451,6 +666,12 @@ class RadarUnitTests(unittest.TestCase):
                 for path in archive_files
             ]
             self.assertEqual(sorted(archive_counts), [2, 350])
+            archived_titles = [
+                node.findtext("title")
+                for path in archive_files
+                for node in ET.parse(path).getroot().findall("channel/item")
+            ]
+            self.assertNotIn("Pending raw item", archived_titles)
             opml_bytes = (site / "netnewswire.opml").read_bytes()
             self.assertTrue(opml_bytes.startswith(b"\xef\xbb\xbf<?xml"))
             opml = ET.parse(site / "netnewswire.opml").getroot()
@@ -483,6 +704,8 @@ class RadarUnitTests(unittest.TestCase):
             (run_id, item_id, "a", "new", "2026-01-01T00:00:00Z"),
         )
         conn.commit()
+        radar.briefs.ensure_fallback_briefs(conn)
+        mark_professional(conn, item_id)
         environment = {
             "RADAR_PUBLIC_BASE_URL": "https://reader.example/radar/",
             "RADAR_WEBSUB_HUB": "https://hub.example/",
