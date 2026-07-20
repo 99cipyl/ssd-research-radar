@@ -200,12 +200,19 @@ def _brief_rows(
     ]
     if "brief_json" not in selected:
         return {}
-    where, parameters = _item_filter("item_id", item_ids)
+    item_columns = _table_columns(connection, "items")
+    include_summary = "summary" in item_columns
+    select_sql = ",".join(f"b.{column}" for column in selected)
+    join_sql = ""
+    if include_summary:
+        select_sql += ",i.summary AS summary"
+        join_sql = " JOIN items i ON i.id=b.item_id"
+    where, parameters = _item_filter("b.item_id", item_ids)
     return {
         int(row["item_id"]): row
         for row in _rows(
             connection,
-            f"SELECT {','.join(selected)} FROM item_briefs{where}",
+            f"SELECT {select_sql} FROM item_briefs b{join_sql}{where}",
             parameters,
         )
     }
@@ -485,13 +492,17 @@ def export_item_pages(
     site_dir: Path | str,
     base_url: str,
     item_ids: Optional[Sequence[int]] = None,
+    *,
+    professional_only: bool = True,
 ) -> Dict[str, Any]:
     """Write ``item.html`` and sharded JSON for the selected database items.
 
     The returned ``by_item_id`` mapping lets RSS/feed builders reuse exactly
-    the same stable URL without querying generated files.  Passing ``None``
-    preserves the historical all-items export; an empty sequence exports no
-    item JSON and removes prior module-owned shards.
+    the same stable URL without querying generated files. Public export is
+    fail-closed by default: missing, retrying, or structurally invalid briefs
+    do not receive a JSON shard. Pass ``professional_only=False`` only for an
+    explicitly private diagnostic export. An empty ``item_ids`` sequence
+    exports no item JSON and removes prior module-owned shards.
     """
 
     destination = Path(site_dir)
@@ -504,6 +515,13 @@ def export_item_pages(
         item_parameters,
     )
     briefs = _brief_rows(connection, selected_ids)
+    if professional_only:
+        items = [
+            item
+            for item in items
+            if _brief_payload(briefs.get(int(item["id"]))).get("is_professional")
+        ]
+        selected_ids = tuple(int(item["id"]) for item in items)
 
     source_where, source_parameters = _item_filter("x.item_id", selected_ids)
     sources = _group_by(

@@ -1506,14 +1506,20 @@ def record_source_failure(conn: sqlite3.Connection, source_id: str, error: BaseE
 
 
 def item_rows(
-    conn: sqlite3.Connection, history_cutoff: Optional[str] = None
+    conn: sqlite3.Connection,
+    history_cutoff: Optional[str] = None,
+    *,
+    professional_only: bool = False,
 ) -> List[sqlite3.Row]:
     briefs.ensure_fallback_briefs(conn)
-    where = ""
+    conditions: List[str] = []
     parameters: List[Any] = []
     if history_cutoff:
-        where = f"WHERE {retention.item_date_sql('i')}>=?"
+        conditions.append(f"{retention.item_date_sql('i')}>=?")
         parameters.append(history_cutoff)
+    if professional_only:
+        conditions.append("b.status='professional'")
+    where = "WHERE " + " AND ".join(conditions) if conditions else ""
     return conn.execute(
         f"""
         SELECT i.*,
@@ -1542,22 +1548,35 @@ def item_rows(
 
 
 def source_rows(
-    conn: sqlite3.Connection, history_cutoff: Optional[str] = None
+    conn: sqlite3.Connection,
+    history_cutoff: Optional[str] = None,
+    *,
+    professional_only: bool = False,
 ) -> List[sqlite3.Row]:
-    if not history_cutoff:
+    if not history_cutoff and not professional_only:
         return conn.execute(
             "SELECT s.*,s.item_count AS window_item_count FROM sources s ORDER BY name"
         ).fetchall()
+    joins = ""
+    conditions = ["x.source_id=s.id"]
+    parameters: List[Any] = []
+    if professional_only:
+        joins = "JOIN item_briefs b ON b.item_id=i.id"
+        conditions.append("b.status='professional'")
+    if history_cutoff:
+        conditions.append(f"{retention.item_date_sql('i')}>=?")
+        parameters.append(history_cutoff)
     return conn.execute(
         f"""
         SELECT s.*,
                (SELECT COUNT(DISTINCT x.item_id)
                 FROM item_sources x JOIN items i ON i.id=x.item_id
-                WHERE x.source_id=s.id AND {retention.item_date_sql('i')}>=?)
+                {joins}
+                WHERE {' AND '.join(conditions)})
                AS window_item_count
         FROM sources s ORDER BY s.name
         """,
-        (history_cutoff,),
+        parameters,
     ).fetchall()
 
 
@@ -1617,12 +1636,12 @@ footer{{color:var(--muted);font-size:13px;margin-top:24px}}
 </style>
 </head>
 <body>
-<header><h1>SSD Research Radar</h1><p>聚焦 SSD / NAND / NVMe 最近 {history_window_years} 年的专业简报，并优先整理从今天起的每日新增与实质更新。</p></header>
+<header><h1>SSD Research Radar</h1><p>只公开 SSD / NAND / NVMe 最近 {history_window_years} 年内已通过校验的专业简报，并优先整理从今天起的每日新增与实质更新。</p></header>
 <main>
   <section class="stats"><div class="stat"><b id="total">0</b><span>近 {history_window_years} 年资料</span></div><div class="stat"><b id="papers">0</b><span>论文</span></div><div class="stat"><b id="recent">0</b><span>近 30 天发布</span></div><div class="stat"><b id="healthy">0</b><span>来源正常</span></div></section>
   <section class="controls"><input id="query" placeholder="搜索标题、作者、摘要……"><select id="topic"><option value="">全部主题</option></select><select id="source"><option value="">全部来源</option></select><select id="year"><option value="">全部年份</option></select></section>
   <div class="layout"><section><div id="items"></div><div class="pager"><button id="prev">上一页</button><span id="page"></span><button id="next">下一页</button></div></section><aside id="status" class="status"></aside></div>
-  <footer>公开历史起点：{history_cutoff or '未限制'}；生成时间：<span id="generated"></span>。旧记录仅在内部用于去重和版本核验，不会当作新资料推送。</footer>
+  <footer>公开历史起点：{history_cutoff or '未限制'}；生成时间：<span id="generated"></span>。待整理或校验失败的条目仅在后台自动重试；窗口外旧记录仅在内部用于去重和版本核验。</footer>
 </main>
 <script id="radar-data" type="application/json">{payload}</script>
 <script>
@@ -2021,8 +2040,11 @@ def build_site(
     SITE_DIR.mkdir(parents=True, exist_ok=True)
     briefs.ensure_fallback_briefs(conn)
     briefs.validate_professional_briefs(conn)
-    rows = item_rows(conn, history_cutoff)
-    sources = source_rows(conn, history_cutoff)
+    # The dashboard, archive JSON and detail shards obey the same fail-closed
+    # publication gate as RSS: a stored fallback/retry brief is internal work,
+    # not content the reader should have to interpret.
+    rows = item_rows(conn, history_cutoff, professional_only=True)
+    sources = source_rows(conn, history_cutoff, professional_only=True)
     items: List[Dict[str, Any]] = []
     for row in rows:
         brief = row_brief(row)
@@ -2055,8 +2077,9 @@ def build_site(
         int(row[0])
         for row in conn.execute(
             """
-            SELECT DISTINCT item_id FROM run_events
-            WHERE suppressed_at IS NULL AND SUBSTR(created_at,1,10)>=?
+            SELECT DISTINCT e.item_id FROM run_events e
+            JOIN item_briefs b ON b.item_id=e.item_id AND b.status='professional'
+            WHERE e.suppressed_at IS NULL AND SUBSTR(e.created_at,1,10)>=?
             """,
             (live_cutoff,),
         )
@@ -2232,6 +2255,8 @@ def report_payload(
     brief_failures: Optional[List[Dict[str, Any]]] = None,
     history_cutoff: Optional[str] = None,
     history_window_years: int = retention.DEFAULT_HISTORY_WINDOW_YEARS,
+    history_reference_date: Optional[str] = None,
+    history_start_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     # Read from the persistent outbox, not only this run.  If a prior process
     # exited after ingesting records but before writing latest.json, those
@@ -2308,6 +2333,8 @@ def report_payload(
         "run_id": run_id,
         "history_window_years": history_window_years,
         "history_cutoff": history_cutoff,
+        "history_reference_date": history_reference_date,
+        "history_start_date": history_start_date,
         # Professional-brief rejection is deliberately fail-closed: the item
         # stays out of every feed and is retried.  It is an important health
         # signal, but it is not a source-ingestion or deployment failure and
@@ -2388,7 +2415,8 @@ def sync_lock() -> Iterator[None]:
 
 def run_sync(force_full: bool = False, report_format: str = "markdown", max_report_items: int = 30) -> Dict[str, Any]:
     config = load_config()
-    history_start = retention.history_cutoff(config)
+    history_reference_date = utcnow().date()
+    history_start = retention.history_cutoff(config, today=history_reference_date)
     window_years = retention.history_window_years(config)
     overlap_days = int(config.get("incremental_overlap_days", 365))
     with sync_lock():
@@ -2531,6 +2559,8 @@ def run_sync(force_full: bool = False, report_format: str = "markdown", max_repo
             brief_failures=brief_failures,
             history_cutoff=history_start,
             history_window_years=window_years,
+            history_reference_date=history_reference_date.isoformat(),
+            history_start_date=str(config.get("history_start_date") or ""),
         )
         report_text = markdown_report(payload, max_report_items)
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2617,7 +2647,7 @@ def command_doctor(_args: argparse.Namespace) -> int:
             problems.append(f"{row['name']}: 尚未完成首次基线")
         if row["last_error"]:
             problems.append(f"{row['name']}: {row['last_error']}")
-    db_count = len(item_rows(conn, cutoff))
+    db_count = len(item_rows(conn, cutoff, professional_only=True))
     archive_path = SITE_DIR / "archive.json"
     if archive_path.exists():
         try:
@@ -2713,7 +2743,10 @@ def command_doctor(_args: argparse.Namespace) -> int:
         except (ET.ParseError, OSError) as exc:
             problems.append(f"{archive_feed.name}: {exc}")
     expected_archived_items = sum(
-        len(chunk) for _filename, _label, chunk in archive_feed_specs(item_rows(conn, cutoff))
+        len(chunk)
+        for _filename, _label, chunk in archive_feed_specs(
+            item_rows(conn, cutoff, professional_only=True)
+        )
     )
     if archived_items != expected_archived_items:
         problems.append(

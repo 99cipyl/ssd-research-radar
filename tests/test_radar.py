@@ -843,6 +843,12 @@ class RadarUnitTests(unittest.TestCase):
         )
         conn.commit()
         radar.briefs.ensure_fallback_briefs(conn)
+        conn.execute(
+            "UPDATE item_briefs SET status='professional',model='broken-test-model',"
+            "brief_json='{}',validation_hash='invalid' WHERE item_id=?",
+            (pending_id,),
+        )
+        conn.commit()
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(radar, "SITE_DIR", Path(directory)), mock.patch.dict(
             os.environ,
             {
@@ -925,17 +931,50 @@ class RadarUnitTests(unittest.TestCase):
             pending_catalogue = json.loads(
                 (site / "archive.json").read_text(encoding="utf-8")
             )
-            pending_entry = next(
-                item for item in pending_catalogue["items"]
-                if item["title"] == "Pending raw item"
+            self.assertEqual(pending_catalogue["item_count"], 1)
+            self.assertEqual(pending_catalogue["sources"][0]["item_count"], 1)
+            self.assertTrue(
+                all(
+                    item["brief_status"] == "professional"
+                    for item in pending_catalogue["items"]
+                )
             )
-            self.assertNotEqual(pending_entry["brief_status"], "professional")
+            self.assertNotIn(
+                "Pending raw item",
+                [item["title"] for item in pending_catalogue["items"]],
+            )
+            self.assertNotEqual(
+                conn.execute(
+                    "SELECT status FROM item_briefs WHERE item_id=?", (pending_id,)
+                ).fetchone()[0],
+                "professional",
+            )
+            pending_public_id = radar.item_page.public_item_id("item:pending")
+            self.assertFalse(
+                (
+                    site
+                    / "items"
+                    / pending_public_id[:2]
+                    / f"{pending_public_id}.json"
+                ).exists()
+            )
 
             baseline_id = conn.execute(
                 "SELECT id FROM items WHERE title='Baseline item 000'"
             ).fetchone()[0]
             mark_professional(conn, baseline_id)
             radar.build_site(conn)
+            backfilled_catalogue = json.loads(
+                (site / "archive.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(backfilled_catalogue["item_count"], 2)
+            self.assertEqual(backfilled_catalogue["sources"][0]["item_count"], 2)
+            self.assertTrue(
+                all(
+                    item["brief_status"] == "professional"
+                    for item in backfilled_catalogue["items"]
+                )
+            )
             self.assertEqual(
                 [path.name for path in sorted(site.glob("professional-archive-*.xml"))],
                 [

@@ -1,3 +1,4 @@
+import datetime as dt
 import json
 import sqlite3
 import tempfile
@@ -13,7 +14,10 @@ from cloud import publish_site, state_db
 
 
 class CloudPublishingTests(unittest.TestCase):
-    HISTORY_CUTOFF = "2021-07-19"
+    HISTORY_CHECKED_AT = dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+    HISTORY_CUTOFF = radar.retention.history_cutoff(
+        {"history_window_years": 5}, today=HISTORY_CHECKED_AT.date()
+    )
 
     def database(self, path: Path) -> sqlite3.Connection:
         connection = sqlite3.connect(path)
@@ -426,6 +430,9 @@ class CloudPublishingTests(unittest.TestCase):
                         "brief_generation_failure_count": 13,
                         "history_window_years": 5,
                         "history_cutoff": self.HISTORY_CUTOFF,
+                        "history_reference_date": self.HISTORY_CHECKED_AT.date().isoformat(),
+                        "history_start_date": "2000-01-01",
+                        "checked_at": self.HISTORY_CHECKED_AT.isoformat(),
                         "failures": [
                             {
                                 "id": "brief_generation",
@@ -447,7 +454,69 @@ class CloudPublishingTests(unittest.TestCase):
             self.assertEqual(status["brief_generation_failure_count"], 13)
             self.assertEqual(status["history_window_years"], 5)
             self.assertEqual(status["history_cutoff"], self.HISTORY_CUTOFF)
+            self.assertEqual(
+                status["history_reference_date"],
+                self.HISTORY_CHECKED_AT.date().isoformat(),
+            )
             self.assertEqual(status["failures"][0]["failed_count"], 13)
+
+    def test_publication_rejects_stale_or_overwide_history_policy(self):
+        stale_checked_at = self.HISTORY_CHECKED_AT - dt.timedelta(days=3)
+        with self.assertRaisesRegex(ValueError, "stale"):
+            publish_site.report_history_policy(
+                {
+                    "history_window_years": 5,
+                    "history_cutoff": radar.retention.history_cutoff(
+                        {"history_window_years": 5},
+                        today=stale_checked_at.date(),
+                    ),
+                    "history_reference_date": stale_checked_at.date().isoformat(),
+                    "checked_at": stale_checked_at.isoformat(),
+                }
+            )
+
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            publish_site.report_history_policy(
+                {
+                    "history_window_years": 5,
+                    "history_cutoff": "2000-01-01",
+                    "history_reference_date": self.HISTORY_CHECKED_AT.date().isoformat(),
+                    "checked_at": self.HISTORY_CHECKED_AT.isoformat(),
+                }
+            )
+
+        future_cutoff = (self.HISTORY_CHECKED_AT.date() + dt.timedelta(days=1)).isoformat()
+        with self.assertRaisesRegex(ValueError, "does not match"):
+            publish_site.report_history_policy(
+                {
+                    "history_window_years": 5,
+                    "history_cutoff": future_cutoff,
+                    "history_reference_date": self.HISTORY_CHECKED_AT.date().isoformat(),
+                    "checked_at": self.HISTORY_CHECKED_AT.isoformat(),
+                }
+            )
+
+    def test_cross_midnight_report_uses_stable_history_reference_date(self):
+        reference_date = self.HISTORY_CHECKED_AT.date() - dt.timedelta(days=1)
+        checked_at = dt.datetime.combine(
+            reference_date + dt.timedelta(days=1),
+            dt.time.min,
+            tzinfo=dt.timezone.utc,
+        )
+        cutoff = radar.retention.history_cutoff(
+            {"history_window_years": 5}, today=reference_date
+        )
+        self.assertEqual(
+            publish_site.report_history_policy(
+                {
+                    "history_window_years": 5,
+                    "history_cutoff": cutoff,
+                    "history_reference_date": reference_date.isoformat(),
+                    "checked_at": checked_at.isoformat(),
+                }
+            ),
+            (cutoff, 5),
+        )
 
     def test_publication_fails_closed_without_report_history_cutoff(self):
         with tempfile.TemporaryDirectory() as directory:

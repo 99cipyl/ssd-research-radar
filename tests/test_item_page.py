@@ -83,7 +83,7 @@ class ItemPageExportTests(unittest.TestCase):
                 "A. Author",
                 "FAST 2026",
                 "2026-02-01T00:00:00Z",
-                "Original " + hostile,
+                "The method schedules GC in idle windows. Original " + hostile,
                 '["FTL","NAND 可靠性"]',
                 "2026-07-19T00:00:00Z",
                 "2026-07-19T01:00:00Z",
@@ -259,12 +259,21 @@ class ItemPageExportTests(unittest.TestCase):
         connection.commit()
 
         with tempfile.TemporaryDirectory() as directory:
-            item_page.export_item_pages(connection, directory, "https://reader.example/")
             public_id = item_page.public_item_id("source:magic")
+            shard = Path(directory) / "items" / public_id[:2] / f"{public_id}.json"
+            public_result = item_page.export_item_pages(
+                connection, directory, "https://reader.example/"
+            )
+            self.assertEqual(public_result["item_count"], 0)
+            self.assertFalse(shard.exists())
+            item_page.export_item_pages(
+                connection,
+                directory,
+                "https://reader.example/",
+                professional_only=False,
+            )
             payload = json.loads(
-                (Path(directory) / "items" / public_id[:2] / f"{public_id}.json").read_text(
-                    encoding="utf-8"
-                )
+                shard.read_text(encoding="utf-8")
             )
         self.assertEqual(payload["brief"]["status"], "missing")
         self.assertFalse(payload["brief"]["is_professional"])
@@ -375,7 +384,10 @@ class ItemPageExportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             site = Path(directory)
             initial = item_page.export_item_pages(
-                connection, site, "https://reader.example/radar/"
+                connection,
+                site,
+                "https://reader.example/radar/",
+                professional_only=False,
             )
             self.assertEqual(initial["item_count"], 2)
             public_ids = [item_page.public_item_id(key) for key in canonical_keys]
@@ -404,6 +416,7 @@ class ItemPageExportTests(unittest.TestCase):
                 site,
                 "https://reader.example/radar/",
                 item_ids=[item_ids[0], item_ids[0], 999_999],
+                professional_only=False,
             )
             self.assertEqual(filtered["item_count"], 1)
             self.assertEqual(set(filtered["by_item_id"]), {item_ids[0]})
@@ -443,7 +456,7 @@ class ItemPageExportTests(unittest.TestCase):
             self.assertTrue((site / "item.html").is_file())
         connection.close()
 
-    def test_malformed_professional_brief_is_downgraded_to_strict_fallback(self):
+    def test_ungrounded_professional_brief_is_downgraded_to_strict_fallback(self):
         connection = database()
         item_id = connection.execute(
             """
@@ -469,14 +482,16 @@ class ItemPageExportTests(unittest.TestCase):
                 0,
             ),
         ).lastrowid
-        # This object omits supporting_quote.  A loose "has some fields"
-        # check would previously have exposed it as a professional brief.
-        malformed = {
+        # The structure and attestation are valid, but the evidence quote is
+        # absent from the stored source summary. A detail-only exporter must
+        # enforce the same evidence grounding as the complete site build.
+        ungrounded = {
             "title_zh": "看似完整",
             "one_liner": "不应发布的模型结论",
             "what_it_is": "内容",
             "problem": "问题",
             "core_idea": "思想",
+            "supporting_quote": "A quote absent from the stored source summary.",
             "mechanism": "机制",
             "evidence": "证据",
             "system_layers": ["FTL"],
@@ -485,28 +500,41 @@ class ItemPageExportTests(unittest.TestCase):
             "limitations": "局限",
             "evidence_level": "source_summary",
         }
+        model = "openai/gpt-4.1-mini"
+        validation_hash = briefs.professional_validation_hash(
+            "source-hash", model, ungrounded
+        )
         connection.execute(
             "INSERT INTO item_briefs VALUES(?,?,?,?,?,?,?,?)",
             (
                 item_id,
                 "source-hash",
                 "professional",
-                "openai/gpt-4.1-mini",
-                json.dumps(malformed, ensure_ascii=False),
+                model,
+                json.dumps(ungrounded, ensure_ascii=False),
                 "2026-07-19T02:00:00Z",
                 None,
-                None,
+                validation_hash,
             ),
         )
         connection.commit()
 
         with tempfile.TemporaryDirectory() as directory:
-            item_page.export_item_pages(connection, directory, "https://reader.example/")
             public_id = item_page.public_item_id("source:broken-professional")
+            shard = Path(directory) / "items" / public_id[:2] / f"{public_id}.json"
+            public_result = item_page.export_item_pages(
+                connection, directory, "https://reader.example/"
+            )
+            self.assertEqual(public_result["item_count"], 0)
+            self.assertFalse(shard.exists())
+            item_page.export_item_pages(
+                connection,
+                directory,
+                "https://reader.example/",
+                professional_only=False,
+            )
             payload = json.loads(
-                (Path(directory) / "items" / public_id[:2] / f"{public_id}.json").read_text(
-                    encoding="utf-8"
-                )
+                shard.read_text(encoding="utf-8")
             )
 
         self.assertEqual(payload["brief"]["status"], "failed")

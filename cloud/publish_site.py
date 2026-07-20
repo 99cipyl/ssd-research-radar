@@ -30,6 +30,7 @@ import retention
 ATOM = "http://www.w3.org/2005/Atom"
 HUB_URL = "https://pubsubhubbub.appspot.com/"
 UTC = dt.timezone.utc
+MAX_REPORT_AGE = dt.timedelta(days=2)
 ET.register_namespace("atom", ATOM)
 
 
@@ -41,7 +42,7 @@ def normalized_base_url(value: str) -> str:
 
 
 def parsed_datetime(value: Optional[str]) -> Optional[dt.datetime]:
-    if not value:
+    if not isinstance(value, str) or not value:
         return None
     try:
         result = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -304,6 +305,40 @@ def report_history_policy(report: Dict[str, Any]) -> tuple[str, int]:
         window_years = retention.history_window_years(report)
     except (TypeError, ValueError) as exc:
         raise ValueError("latest report has invalid history_window_years") from exc
+    checked_at = parsed_datetime(report.get("checked_at"))
+    if checked_at is None:
+        raise ValueError("latest report is missing a valid checked_at timestamp")
+    reference_text = report.get("history_reference_date")
+    if not isinstance(reference_text, str) or not reference_text.strip():
+        raise ValueError("latest report is missing history_reference_date")
+    try:
+        reference_date = dt.date.fromisoformat(reference_text.strip())
+    except ValueError as exc:
+        raise ValueError(
+            "latest report history_reference_date must be an ISO date"
+        ) from exc
+    if reference_date.isoformat() != reference_text.strip():
+        raise ValueError("latest report history_reference_date must be an ISO date")
+    now = dt.datetime.now(UTC)
+    age = now - checked_at
+    if age > MAX_REPORT_AGE or age < -dt.timedelta(minutes=10):
+        raise ValueError("latest report is stale or has an invalid future timestamp")
+    run_days = (checked_at.date() - reference_date).days
+    if run_days not in (0, 1):
+        raise ValueError(
+            "latest report history_reference_date is inconsistent with checked_at"
+        )
+    expected_cutoff = retention.history_cutoff(
+        {
+            "history_window_years": window_years,
+            "history_start_date": str(report.get("history_start_date") or ""),
+        },
+        today=reference_date,
+    )
+    if cutoff != expected_cutoff:
+        raise ValueError(
+            "latest report history_cutoff does not match its rolling history policy"
+        )
     return cutoff, window_years
 
 
@@ -325,6 +360,7 @@ def build_status(
         "checked_at": report.get("checked_at"),
         "history_window_years": history_window_years,
         "history_cutoff": history_cutoff,
+        "history_reference_date": report.get("history_reference_date"),
         "new_count": int(report.get("new_count", 0)),
         "updated_count": int(report.get("updated_count", 0)),
         "awaiting_brief_count": int(report.get("awaiting_brief_count", 0)),
