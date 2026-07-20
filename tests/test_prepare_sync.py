@@ -159,6 +159,18 @@ class PrepareSyncTests(unittest.TestCase):
         )[0]
         self.assertIn("export RADAR_BRIEF_HISTORY_LIMIT=0", monthly_case)
 
+    def test_workflow_limits_recent_history_backfill_and_tracks_retention_module(self):
+        workflow = (ROOT / ".github/workflows/publish-radar.yml").read_text(
+            encoding="utf-8"
+        )
+        academic_case = workflow.split("            academic)", 1)[1].split(
+            "              ;;", 1
+        )[0]
+        self.assertIn("export RADAR_BRIEF_HISTORY_LIMIT=40", academic_case)
+        self.assertNotIn("RADAR_BRIEF_HISTORY_LIMIT=120", workflow)
+        self.assertIn("      - retention.py", workflow)
+        self.assertIn("item_page.py retention.py cloud/*.py", workflow)
+
     def test_workflow_treats_brief_retry_as_warning_not_failed_deployment(self):
         workflow = (ROOT / ".github/workflows/publish-radar.yml").read_text(
             encoding="utf-8"

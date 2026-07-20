@@ -13,6 +13,7 @@ import hashlib
 import html
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import urllib.parse
@@ -154,7 +155,30 @@ def _normalise_brief_content(raw: Any) -> Dict[str, Any]:
     return result
 
 
-def _brief_rows(connection: sqlite3.Connection) -> Dict[int, Dict[str, Any]]:
+def _normalised_item_ids(item_ids: Optional[Sequence[int]]) -> Optional[tuple[int, ...]]:
+    if item_ids is None:
+        return None
+    return tuple(dict.fromkeys(int(item_id) for item_id in item_ids))
+
+
+def _item_filter(
+    column: str, item_ids: Optional[Sequence[int]]
+) -> tuple[str, tuple[int, ...]]:
+    """Return a parameterized item-id filter for a module-owned SQL query."""
+
+    if item_ids is None:
+        return "", ()
+    normalized = tuple(item_ids)
+    if not normalized:
+        return " WHERE 0", ()
+    placeholders = ",".join("?" for _ in normalized)
+    return f" WHERE {column} IN ({placeholders})", normalized
+
+
+def _brief_rows(
+    connection: sqlite3.Connection,
+    item_ids: Optional[Sequence[int]] = None,
+) -> Dict[int, Dict[str, Any]]:
     columns = _table_columns(connection, "item_briefs")
     if not columns or "item_id" not in columns:
         return {}
@@ -176,9 +200,14 @@ def _brief_rows(connection: sqlite3.Connection) -> Dict[int, Dict[str, Any]]:
     ]
     if "brief_json" not in selected:
         return {}
+    where, parameters = _item_filter("item_id", item_ids)
     return {
         int(row["item_id"]): row
-        for row in _rows(connection, f"SELECT {','.join(selected)} FROM item_briefs")
+        for row in _rows(
+            connection,
+            f"SELECT {','.join(selected)} FROM item_briefs{where}",
+            parameters,
+        )
     }
 
 
@@ -262,6 +291,38 @@ def _event_payload(row: Mapping[str, Any]) -> Dict[str, Any]:
         "delivered_at": _string(row.get("delivered_at")),
         "websub_published_at": _string(row.get("websub_published_at")),
     }
+
+
+def _clean_stale_item_shards(items_root: Path, expected: set[Path]) -> None:
+    """Remove only obsolete JSON shards created by this module.
+
+    Other files, malformed shard names, and symlinked directories are left
+    untouched so a cleanup can never escape ``site/items`` or delete an asset
+    owned by another publisher.
+    """
+
+    if not items_root.is_dir() or items_root.is_symlink():
+        return
+    for shard_dir in items_root.iterdir():
+        if (
+            shard_dir.is_symlink()
+            or not shard_dir.is_dir()
+            or re.fullmatch(r"[0-9a-f]{2}", shard_dir.name) is None
+        ):
+            continue
+        for candidate in shard_dir.iterdir():
+            if candidate.is_symlink() or not candidate.is_file():
+                continue
+            match = re.fullmatch(r"([0-9a-f]{32})\.json", candidate.name)
+            if not match or match.group(1)[:2] != shard_dir.name:
+                continue
+            if candidate not in expected:
+                candidate.unlink()
+        try:
+            shard_dir.rmdir()
+        except OSError:
+            # Expected shards or unrelated assets still occupy the directory.
+            pass
 
 
 def _item_html(base_url: str) -> str:
@@ -423,39 +484,54 @@ def export_item_pages(
     connection: sqlite3.Connection,
     site_dir: Path | str,
     base_url: str,
+    item_ids: Optional[Sequence[int]] = None,
 ) -> Dict[str, Any]:
-    """Write ``item.html`` and one sharded JSON document per database item.
+    """Write ``item.html`` and sharded JSON for the selected database items.
 
     The returned ``by_item_id`` mapping lets RSS/feed builders reuse exactly
-    the same stable URL without querying generated files.
+    the same stable URL without querying generated files.  Passing ``None``
+    preserves the historical all-items export; an empty sequence exports no
+    item JSON and removes prior module-owned shards.
     """
 
     destination = Path(site_dir)
     base = _normalised_base_url(base_url)
-    items = _rows(connection, "SELECT * FROM items ORDER BY id")
-    briefs = _brief_rows(connection)
+    selected_ids = _normalised_item_ids(item_ids)
+    item_where, item_parameters = _item_filter("id", selected_ids)
+    items = _rows(
+        connection,
+        f"SELECT * FROM items{item_where} ORDER BY id",
+        item_parameters,
+    )
+    briefs = _brief_rows(connection, selected_ids)
 
+    source_where, source_parameters = _item_filter("x.item_id", selected_ids)
     sources = _group_by(
         _rows(
             connection,
-            """
+            f"""
             SELECT x.item_id,x.source_id,x.external_id,x.source_url,x.first_seen_at,x.last_seen_at,
                    s.name AS source_name,s.category,s.homepage
             FROM item_sources x LEFT JOIN sources s ON s.id=x.source_id
+            {source_where}
             ORDER BY x.item_id,s.name,x.source_id,x.external_id
             """,
+            source_parameters,
         ),
         "item_id",
     )
+    version_where, version_parameters = _item_filter("v.item_id", selected_ids)
     versions = _group_by(
         _rows(
             connection,
-            """
+            f"""
             SELECT v.item_id,v.source_id,v.captured_at,v.title,v.url,v.published_at,
                    s.name AS source_name
             FROM item_versions v LEFT JOIN sources s ON s.id=v.source_id
+            {version_where}
             ORDER BY v.item_id,v.captured_at DESC,v.source_id
             """,
+            version_parameters,
         ),
         "item_id",
     )
@@ -466,6 +542,13 @@ def export_item_pages(
     event_select = ",".join(f"e.{column}" for column in optional_events)
     if event_select:
         event_select = "," + event_select
+    event_where, event_parameters = _item_filter("e.item_id", selected_ids)
+    if "suppressed_at" in event_columns:
+        event_where += (
+            " AND e.suppressed_at IS NULL"
+            if event_where
+            else " WHERE e.suppressed_at IS NULL"
+        )
     events = _group_by(
         _rows(
             connection,
@@ -473,13 +556,16 @@ def export_item_pages(
             SELECT e.item_id,e.run_id,e.source_id,e.event_type,e.created_at{event_select},
                    s.name AS source_name
             FROM run_events e LEFT JOIN sources s ON s.id=e.source_id
+            {event_where}
             ORDER BY e.item_id,e.created_at DESC,e.run_id DESC
             """,
+            event_parameters,
         ),
         "item_id",
     )
 
     by_item_id: Dict[int, Dict[str, str]] = {}
+    expected_shards: set[Path] = set()
     for item in items:
         item_id = int(item["id"])
         public_id = public_item_id(str(item["canonical_key"]))
@@ -510,13 +596,20 @@ def export_item_pages(
             "versions": [_version_payload(row) for row in versions.get(item_id, [])],
             "events": [_event_payload(row) for row in events.get(item_id, [])],
         }
+        original_published_at = _string(item.get("original_published_at")) or _string(
+            item.get("published_at")
+        )
+        if original_published_at:
+            payload["original_published_at"] = original_published_at
         shard_path = destination / "items" / public_id[:2] / f"{public_id}.json"
+        expected_shards.add(shard_path)
         _atomic_write_text(
             shard_path,
             json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
         )
         by_item_id[item_id] = {"public_id": public_id, "url": page_url}
 
+    _clean_stale_item_shards(destination / "items", expected_shards)
     _atomic_write_text(destination / "item.html", _item_html(base))
     return {
         "item_count": len(items),

@@ -17,12 +17,21 @@ After GitHub Pages is enabled with **Source: GitHub Actions**:
 - Per-item Chinese brief: `https://99cipyl.github.io/ssd-research-radar/item.html?id=<public_id>`
 
 Subscribe to `live.xml` for daily updates, and import `netnewswire.opml` once
-when the historical archive is wanted. The OPML contains the live feed plus
+when the rolling recent-five-year archive is wanted. The OPML contains the live feed plus
 32 immutable hash-bucket archive feeds. Their URLs are pre-created and a
 canonical item never changes bucket; only professionally validated rows are
 emitted. This lets one import receive later discoveries and backfill without
 another OPML import. `full.xml` is the single-feed professional export, but
 server-side readers may truncate it as it grows.
+
+The public dashboard, item shards, archive feeds, and historical model backfill
+use one exact rolling five-year cutoff based on an item's earliest known
+publication date, which may only move earlier when better evidence appears. Older rows remain only in the private SQLite state for
+deduplication and version evidence. A newly discovered old paper is not emitted
+as a new event, while a material change made today to an older paper remains a
+current update and is eligible for the live feed. Reader apps may retain older
+entries that they cached before this policy was deployed; the server cannot
+remotely delete those local copies.
 
 Each RSS item links to the local Chinese brief first; the original source is a
 separate button inside that page. Historical, new, and updated items are all
@@ -88,7 +97,7 @@ to the site, report, state branch, or logs by the cloud helper scripts.
 Professional summaries use the job's short-lived built-in `GITHUB_TOKEN` with
 the workflow's `models: read` permission and the `openai/gpt-4.1-mini` GitHub
 Models endpoint. Manual runs backfill 12 recent historical items; the daily
-academic run backfills up to 120 within a 20-minute model budget. Frequent and
+academic run backfills up to 40 recent-window items within a 20-minute model budget. Frequent and
 monthly runs set the historical backfill limit to zero, so the monthly FAST
 rescan does not duplicate the daily academic model batch. Live events are
 attempted first, at most 12 per run, and do not count against those history
@@ -110,8 +119,9 @@ This is near-real-time RSS, not a hard real-time push system:
   subscribe to `full.xml` through a WebSub-aware server account such as Feedbin
   and use Feedbin Notifier, then connect that account inside NetNewsWire.
 
-The initial cloud run has no state branch, so it performs the full baseline and
+The initial cloud run has no state branch, so it performs the rolling five-year baseline and
 can be much slower than later runs. That baseline is deliberately not emitted as
-thousands of "new" events. The complete catalogue remains searchable on the
-dashboard; each historical item enters `full.xml` and its fixed archive feed
-only after the professional brief passes validation.
+"new" events. The recent-window catalogue remains searchable on the dashboard;
+each historical item enters `full.xml` and its fixed archive feed only after the
+professional brief passes validation. Current events always take priority over
+historical backfill.

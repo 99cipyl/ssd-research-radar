@@ -9,6 +9,7 @@ on:
       - briefs.py
       - evidence.py
       - item_page.py
+      - retention.py
       - sources.json
       - cloud/**
       - tests/**
@@ -55,7 +56,7 @@ jobs:
       - name: Run regression tests before touching production state
         run: |
           python3 -m unittest discover -s tests -q
-          python3 -m py_compile radar.py briefs.py evidence.py item_page.py cloud/*.py
+          python3 -m py_compile radar.py briefs.py evidence.py item_page.py retention.py cloud/*.py
 
       - name: Restore durable state branch
         id: restore
@@ -134,7 +135,7 @@ jobs:
               export RADAR_BRIEF_RETRY_SECONDS=0
               ;;
             academic)
-              export RADAR_BRIEF_HISTORY_LIMIT=120
+              export RADAR_BRIEF_HISTORY_LIMIT=40
               export RADAR_BRIEF_TIME_BUDGET=1200
               ;;
             monthly)

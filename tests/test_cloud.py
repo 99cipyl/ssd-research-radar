@@ -13,6 +13,8 @@ from cloud import publish_site, state_db
 
 
 class CloudPublishingTests(unittest.TestCase):
+    HISTORY_CUTOFF = "2021-07-19"
+
     def database(self, path: Path) -> sqlite3.Connection:
         connection = sqlite3.connect(path)
         connection.row_factory = sqlite3.Row
@@ -29,13 +31,14 @@ class CloudPublishingTests(unittest.TestCase):
             item_id = connection.execute(
                 """
                 INSERT INTO items(
-                    canonical_key,item_type,title,normalized_title,url,published_at,summary,
-                    topics_json,discovered_at,updated_at,baseline
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    canonical_key,item_type,title,normalized_title,url,published_at,
+                    original_published_at,summary,topics_json,discovered_at,updated_at,baseline
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     f"item:{number}", "paper", f"Paper {number}", f"paper {number}",
                     f"https://source.example/{number}", "2026-01-01T00:00:00Z",
+                    "2026-01-01T00:00:00Z",
                     "A source abstract that must not become the feed link.", "[]",
                     "2026-07-19T00:00:00Z", "2026-07-19T00:00:00Z", baseline,
                 ),
@@ -99,12 +102,20 @@ class CloudPublishingTests(unittest.TestCase):
             connection.close()
             destination = site / "full.xml"
             count = publish_site.build_full_feed(
-                database, destination, "https://reader.example/radar/"
+                database,
+                destination,
+                "https://reader.example/radar/",
+                history_cutoff=self.HISTORY_CUTOFF,
             )
             root = ET.parse(destination).getroot()
             items = root.findall("channel/item")
             self.assertEqual(count, 2)
             self.assertEqual(len(items), 2)
+            description = root.findtext("channel/description") or ""
+            self.assertIn("滚动最近 5 年", description)
+            self.assertIn("旧资料今天发生的实质更新仍可发布", description)
+            self.assertIn("迟发现的窗口外旧资料不作为新增", description)
+            self.assertIn(self.HISTORY_CUTOFF, description)
             for item in items:
                 link = item.findtext("link") or ""
                 description = item.findtext("description") or ""
@@ -131,7 +142,10 @@ class CloudPublishingTests(unittest.TestCase):
             connection.close()
             destination = Path(directory) / "full.xml"
             count = publish_site.build_full_feed(
-                database, destination, "https://reader.example/radar/"
+                database,
+                destination,
+                "https://reader.example/radar/",
+                history_cutoff=self.HISTORY_CUTOFF,
             )
             self.assertEqual(count, 1)
             titles = [node.findtext("title") for node in ET.parse(destination).findall("channel/item")]
@@ -149,7 +163,10 @@ class CloudPublishingTests(unittest.TestCase):
             connection.close()
             destination = Path(directory) / "full.xml"
             count = publish_site.build_full_feed(
-                database, destination, "https://reader.example/radar/"
+                database,
+                destination,
+                "https://reader.example/radar/",
+                history_cutoff=self.HISTORY_CUTOFF,
             )
             self.assertEqual(count, 1)
             titles = [
@@ -157,6 +174,110 @@ class CloudPublishingTests(unittest.TestCase):
                 for node in ET.parse(destination).findall("channel/item")
             ]
             self.assertEqual(titles, ["中文：Paper 2"])
+
+    def test_full_feed_uses_immutable_date_for_history_baseline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "radar.sqlite3"
+            connection = self.database(database)
+            connection.execute(
+                "UPDATE items SET original_published_at='2020-01-01T00:00:00Z',"
+                "published_at='2026-07-19T00:00:00Z' WHERE baseline=1"
+            )
+            connection.commit()
+            connection.close()
+
+            destination = Path(directory) / "full.xml"
+            count = publish_site.build_full_feed(
+                database,
+                destination,
+                "https://reader.example/radar/",
+                history_cutoff=self.HISTORY_CUTOFF,
+            )
+            self.assertEqual(count, 1)
+            titles = [
+                node.findtext("title")
+                for node in ET.parse(destination).findall("channel/item")
+            ]
+            self.assertEqual(titles, ["中文：Paper 2"])
+
+    def test_current_update_to_old_item_remains_in_full_feed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "radar.sqlite3"
+            connection = self.database(database)
+            connection.execute(
+                "UPDATE items SET original_published_at='2020-01-01T00:00:00Z' "
+                "WHERE baseline=0"
+            )
+            connection.execute(
+                "UPDATE run_events SET event_type='updated' WHERE event_type='new'"
+            )
+            connection.commit()
+            connection.close()
+
+            destination = Path(directory) / "full.xml"
+            count = publish_site.build_full_feed(
+                database,
+                destination,
+                "https://reader.example/radar/",
+                history_cutoff=self.HISTORY_CUTOFF,
+            )
+            self.assertEqual(count, 2)
+            titles = [
+                node.findtext("title")
+                for node in ET.parse(destination).findall("channel/item")
+            ]
+            self.assertIn("[更新] 中文：Paper 2", titles)
+
+    def test_late_discovered_old_item_is_not_published_as_new(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "radar.sqlite3"
+            connection = self.database(database)
+            connection.execute(
+                "UPDATE items SET original_published_at='2020-01-01T00:00:00Z' "
+                "WHERE baseline=0"
+            )
+            connection.commit()
+            connection.close()
+
+            destination = Path(directory) / "full.xml"
+            count = publish_site.build_full_feed(
+                database,
+                destination,
+                "https://reader.example/radar/",
+                history_cutoff=self.HISTORY_CUTOFF,
+            )
+            self.assertEqual(count, 1)
+            titles = [
+                node.findtext("title")
+                for node in ET.parse(destination).findall("channel/item")
+            ]
+            self.assertEqual(titles, ["中文：Paper 1"])
+
+    def test_suppressed_or_expired_events_are_not_in_full_feed(self):
+        for update_sql in (
+            "UPDATE run_events SET suppressed_at='2026-07-19T02:00:00Z'",
+            "UPDATE run_events SET created_at='2020-07-19T01:00:00Z'",
+        ):
+            with self.subTest(update_sql=update_sql), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / "radar.sqlite3"
+                connection = self.database(database)
+                connection.execute(update_sql)
+                connection.commit()
+                connection.close()
+
+                destination = Path(directory) / "full.xml"
+                count = publish_site.build_full_feed(
+                    database,
+                    destination,
+                    "https://reader.example/radar/",
+                    history_cutoff=self.HISTORY_CUTOFF,
+                )
+                self.assertEqual(count, 1)
+                titles = [
+                    node.findtext("title")
+                    for node in ET.parse(destination).findall("channel/item")
+                ]
+                self.assertEqual(titles, ["中文：Paper 1"])
 
     def test_brief_content_is_material_but_retry_bookkeeping_is_not(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -194,6 +315,74 @@ class CloudPublishingTests(unittest.TestCase):
             connection.commit()
             connection.close()
             self.assertNotEqual(state_db.material_fingerprint(database), before)
+
+    def test_retention_date_and_event_suppression_are_material_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "radar.sqlite3"
+            connection = self.database(database)
+            connection.close()
+            before = state_db.material_fingerprint(database)
+
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "UPDATE items SET original_published_at='2025-12-31T00:00:00Z' "
+                "WHERE id=(SELECT MIN(id) FROM items)"
+            )
+            connection.commit()
+            connection.close()
+            changed_date = state_db.material_fingerprint(database)
+            self.assertNotEqual(changed_date, before)
+
+            connection = sqlite3.connect(database)
+            connection.execute(
+                "UPDATE items SET original_published_at='2026-01-01T00:00:00Z' "
+                "WHERE id=(SELECT MIN(id) FROM items)"
+            )
+            connection.execute(
+                "UPDATE run_events SET suppressed_at='2026-07-19T02:00:00Z',"
+                "suppression_reason='outside_retention_window'"
+            )
+            connection.commit()
+            connection.close()
+            self.assertNotEqual(state_db.material_fingerprint(database), before)
+
+    def test_material_fingerprint_reads_pre_retention_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "old.sqlite3"
+            connection = sqlite3.connect(database)
+            connection.executescript(
+                """
+                CREATE TABLE items(
+                    id INTEGER PRIMARY KEY,canonical_key TEXT,item_type TEXT,title TEXT,
+                    normalized_title TEXT,url TEXT,doi TEXT,authors TEXT,venue TEXT,
+                    published_at TEXT,summary TEXT,topics_json TEXT,baseline INTEGER
+                );
+                CREATE TABLE item_sources(
+                    source_id TEXT,external_id TEXT,item_id INTEGER,source_url TEXT,raw_hash TEXT
+                );
+                CREATE TABLE item_versions(
+                    item_id INTEGER,source_id TEXT,raw_hash TEXT,title TEXT,url TEXT,
+                    published_at TEXT,summary TEXT
+                );
+                CREATE TABLE run_events(
+                    run_id INTEGER,item_id INTEGER,source_id TEXT,event_type TEXT,created_at TEXT
+                );
+                INSERT INTO items VALUES(
+                    1,'old','paper','Old','old','https://example.test/old',NULL,NULL,NULL,
+                    '2020-01-01T00:00:00Z','Summary','[]',1
+                );
+                INSERT INTO item_sources VALUES('s','old',1,'https://example.test/old','hash');
+                INSERT INTO item_versions VALUES(
+                    1,'s','hash','Old','https://example.test/old','2020-01-01T00:00:00Z','Summary'
+                );
+                INSERT INTO run_events VALUES(1,1,'s','new','2020-01-02T00:00:00Z');
+                """
+            )
+            connection.commit()
+            connection.close()
+
+            fingerprint = state_db.material_fingerprint(database)
+            self.assertRegex(fingerprint, r"^[a-f0-9]{64}$")
 
     def test_material_fingerprint_reads_pre_attestation_brief_schema(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -235,6 +424,8 @@ class CloudPublishingTests(unittest.TestCase):
                         "source_failure_count": 0,
                         "brief_generation_ok": False,
                         "brief_generation_failure_count": 13,
+                        "history_window_years": 5,
+                        "history_cutoff": self.HISTORY_CUTOFF,
                         "failures": [
                             {
                                 "id": "brief_generation",
@@ -254,7 +445,69 @@ class CloudPublishingTests(unittest.TestCase):
             self.assertEqual(status["source_failure_count"], 0)
             self.assertFalse(status["brief_generation_ok"])
             self.assertEqual(status["brief_generation_failure_count"], 13)
+            self.assertEqual(status["history_window_years"], 5)
+            self.assertEqual(status["history_cutoff"], self.HISTORY_CUTOFF)
             self.assertEqual(status["failures"][0]["failed_count"], 13)
+
+    def test_publication_fails_closed_without_report_history_cutoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = root / "latest.json"
+            destination = root / "status.json"
+            report.write_text(json.dumps({"ok": True}), encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "history_cutoff"):
+                publish_site.build_status(report, destination)
+            self.assertFalse(destination.exists())
+
+    def test_publish_entrypoint_validates_cutoff_before_mutating_site(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            database = root / "radar.sqlite3"
+            connection = self.database(database)
+            connection.close()
+            report = root / "latest.json"
+            report.write_text(json.dumps({"ok": True}), encoding="utf-8")
+            site = root / "site"
+            site.mkdir()
+            live = site / "live.xml"
+            live.write_text("unchanged", encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "history_cutoff"):
+                publish_site.main(
+                    [
+                        "--site",
+                        str(site),
+                        "--database",
+                        str(database),
+                        "--report",
+                        str(report),
+                        "--base-url",
+                        "https://reader.example/radar/",
+                    ]
+                )
+            self.assertEqual(live.read_text(encoding="utf-8"), "unchanged")
+
+    def test_live_feed_description_exposes_rolling_history_policy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            feed = Path(directory) / "live.xml"
+            feed.write_text(
+                "<?xml version='1.0' encoding='utf-8'?><rss version='2.0'>"
+                "<channel><title>Live</title><link>http://127.0.0.1/</link>"
+                "<description>old</description></channel></rss>",
+                encoding="utf-8",
+            )
+            publish_site.rewrite_live_feed(
+                feed,
+                "https://reader.example/radar/",
+                history_window_years=5,
+                history_cutoff=self.HISTORY_CUTOFF,
+            )
+            description = ET.parse(feed).findtext("channel/description") or ""
+            self.assertIn("滚动最近 5 年", description)
+            self.assertIn("旧资料今天发生的实质更新仍会发布", description)
+            self.assertIn("迟发现的窗口外旧资料不作为新增", description)
+            self.assertIn(self.HISTORY_CUTOFF, description)
 
 
 if __name__ == "__main__":

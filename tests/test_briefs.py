@@ -20,6 +20,7 @@ CREATE TABLE items (
     authors TEXT,
     venue TEXT,
     published_at TEXT,
+    original_published_at TEXT,
     summary TEXT,
     topics_json TEXT NOT NULL DEFAULT '[]',
     discovered_at TEXT NOT NULL,
@@ -82,13 +83,20 @@ class BriefTests(unittest.TestCase):
     def tearDown(self):
         self.conn.close()
 
-    def add_item(self, key="doi:10.1/test", summary="", topics=None):
+    def add_item(
+        self,
+        key="doi:10.1/test",
+        summary="",
+        topics=None,
+        published_at="2026-02-01",
+    ):
         cursor = self.conn.execute(
             """
             INSERT INTO items(
                 canonical_key,item_type,title,url,authors,venue,published_at,
+                original_published_at,
                 summary,topics_json,discovered_at,updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 key,
@@ -97,7 +105,8 @@ class BriefTests(unittest.TestCase):
                 "https://example.com/paper",
                 "A. Author",
                 "FAST",
-                "2026-02-01",
+                published_at,
+                published_at,
                 summary,
                 json.dumps(topics or [], ensure_ascii=False),
                 "2026-07-19T00:00:00+00:00",
@@ -425,6 +434,37 @@ class BriefTests(unittest.TestCase):
         self.assertEqual(candidates[4]["status"], "retry")
         self.assertTrue({row["id"] for row in candidates[:4]} <= set(fresh_ids))
         self.assertIn(candidates[4]["id"], retry_ids)
+
+    def test_history_backfill_excludes_old_rows_but_priority_update_can_use_them(self):
+        old = self.add_item(
+            key="doi:10.1/old-update",
+            summary="Old paper received a material update.",
+            published_at="2019-01-01",
+        )
+        recent = self.add_item(
+            key="doi:10.1/recent-history",
+            summary="Recent SSD evidence.",
+            published_at="2026-01-01",
+        )
+        briefs.ensure_fallback_briefs(self.conn)
+
+        history = briefs._candidate_rows(
+            self.conn,
+            [],
+            history_limit=10,
+            retry_after_seconds=0,
+            history_start_date="2021-07-20",
+        )
+        self.assertEqual([row["id"] for row in history], [recent])
+
+        priority = briefs._candidate_rows(
+            self.conn,
+            [old],
+            history_limit=0,
+            retry_after_seconds=0,
+            history_start_date="2021-07-20",
+        )
+        self.assertEqual([row["id"] for row in priority], [old])
 
     def test_duplicate_titles_are_never_sent_in_the_same_model_batch(self):
         candidates = [

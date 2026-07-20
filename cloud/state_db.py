@@ -23,25 +23,54 @@ from typing import Iterable, Sequence
 EMPTY_FINGERPRINT = "empty"
 
 
-MATERIAL_QUERIES: Sequence[str] = (
-    """
-    SELECT canonical_key,item_type,title,normalized_title,url,doi,authors,venue,
-           published_at,summary,topics_json,baseline
-    FROM items ORDER BY id
-    """,
-    """
+ITEM_SOURCE_QUERY = """
     SELECT source_id,external_id,item_id,source_url,raw_hash
     FROM item_sources ORDER BY source_id,external_id
-    """,
-    """
+"""
+
+ITEM_VERSION_QUERY = """
     SELECT item_id,source_id,raw_hash,title,url,published_at,summary
     FROM item_versions ORDER BY item_id,source_id,raw_hash
-    """,
-    """
-    SELECT run_id,item_id,source_id,event_type,created_at
-    FROM run_events ORDER BY run_id,item_id,event_type
-    """,
-)
+"""
+
+
+def material_queries(connection: sqlite3.Connection) -> Sequence[str]:
+    """Build migration-safe material queries for the durable state branch."""
+
+    item_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(items)")
+    }
+    event_columns = {
+        str(row[1]) for row in connection.execute("PRAGMA table_info(run_events)")
+    }
+    original_date = (
+        "original_published_at"
+        if "original_published_at" in item_columns
+        else "NULL AS original_published_at"
+    )
+    suppressed_at = (
+        "suppressed_at" if "suppressed_at" in event_columns else "NULL AS suppressed_at"
+    )
+    suppression_reason = (
+        "suppression_reason"
+        if "suppression_reason" in event_columns
+        else "NULL AS suppression_reason"
+    )
+    return (
+        f"""
+        SELECT canonical_key,item_type,title,normalized_title,url,doi,authors,venue,
+               published_at,{original_date},summary,topics_json,baseline
+        FROM items ORDER BY id
+        """,
+        ITEM_SOURCE_QUERY,
+        ITEM_VERSION_QUERY,
+        f"""
+        SELECT run_id,item_id,source_id,event_type,created_at,
+               {suppressed_at},{suppression_reason}
+        FROM run_events ORDER BY run_id,item_id,event_type
+        """,
+    )
+
 
 BRIEF_QUERY = """
     SELECT item_id,public_id,source_hash,
@@ -127,7 +156,7 @@ def material_fingerprint(path: Path) -> str:
         if item_count == 0 and version_count == 0 and event_count == 0:
             return EMPTY_FINGERPRINT
         digest = hashlib.sha256()
-        queries = list(MATERIAL_QUERIES)
+        queries = list(material_queries(connection))
         tables = {
             row[0]
             for row in connection.execute(

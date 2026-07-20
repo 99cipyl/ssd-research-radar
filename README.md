@@ -1,8 +1,8 @@
 # SSD Research Radar
 
-这是一个 SSD / NAND / NVMe 资料聚合器。它解决三个不同的问题：
+这是一个 SSD / NAND / NVMe 资料聚合器。它解决四个不同的问题：
 
-1. SQLite 和 HTML 面板负责保存、检索历史；
+1. HTML 面板与历史 Feed 只公开滚动最近 5 年的资料；SQLite 中的更旧行只用于去重、版本核验和防止旧资料被误报为新增；
 2. Codex 定时检查负责只在出现新资料或来源异常时通知。
 3. 公网 RSS、分卷历史 Feed 和 OPML 供 NetNewsWire 等手机阅读器订阅。
 4. 每个条目先进入站内中文研究简报，再由简报提供原文入口；实时 Feed 不直接把读者丢到原站。
@@ -11,10 +11,10 @@
 
 ## 已接入来源
 
-- DBLP 的 USENIX FAST 全部可检索论文；
+- DBLP 的 USENIX FAST 近 5 年可检索论文；
 - NVMW 官方 Program（按每个报告拆分，并保留官方 Abstract）；
-- ETH SAFARI 网站公开的全部 WordPress 文章；
-- NVM Express 网站公开的全部 WordPress 文章、技术资源，以及按具体规范拆分的当前版本变化；
+- ETH SAFARI 网站近 5 年的 WordPress 文章与今后更新；
+- NVM Express 网站近 5 年文章、技术资源，以及按具体规范拆分的当前版本变化；
 - OCP Storage 公开 RSS；
 - OpenAlex 中与 FTL、GC、wear leveling、NAND retention/disturb/read-retry/scrubbing、ZNS、FDP、KV SSD 和计算存储匹配的论文。
 
@@ -22,7 +22,7 @@ Google Scholar 和 IEEE Xplore 没有适合本机无凭据轮询的稳定公开 
 
 ## 使用
 
-首次同步会回溯历史并建立基线，但不会把旧资料推送成“新增”：
+首次同步会回溯滚动最近 5 年并建立基线，但不会把旧资料推送成“新增”：
 
 ```bash
 cd /path/to/ssd-research-radar
@@ -61,10 +61,10 @@ python3 radar.py build
 发布 `site/` 目录后，可以：
 
 - 只订阅即时更新：`https://YOUR_NAME.github.io/ssd-research-radar/live.xml`；
-- 打开 `https://YOUR_NAME.github.io/ssd-research-radar/import.html` 下载并导入 OPML，一次获得即时 Feed 和所有历史分卷；
+- 打开 `https://YOUR_NAME.github.io/ssd-research-radar/import.html` 下载并导入 OPML，一次获得即时 Feed 和最近 5 年的历史分卷；
 - `feed.xml` 是与 `live.xml` 字节完全相同的兼容别名，旧订阅无需迁移。
 
-`live.xml` 最多保留最近 350 个“首次基线以后新增或实质更新”的事件。首次建库导入的旧资料不会进入 Live，也不会制造几千条未读通知。专业简报历史使用 32 个预创建的稳定哈希分片 `professional-archive-01.xml` 至 `professional-archive-32.xml`；条目按稳定 canonical key 分配，新增旧论文、日期修正和专业回填都不会让它跨 Feed。分片只发布通过校验的专业简报，全部公网地址一次性写入 `netnewswire.opml`。
+`live.xml` 最多保留最近 350 个“首次基线以后新增或实质更新”的事件。首次建库导入的旧资料不会进入 Live，也不会制造几千条未读通知。历史快照按首发日保留最近 5 年；一篇更旧的资料如果今天发生实质更新，仍会作为当天事件进入 Live。专业简报历史使用 32 个预创建的稳定哈希分片 `professional-archive-01.xml` 至 `professional-archive-32.xml`；分片只发布通过校验的专业简报，全部公网地址一次性写入 `netnewswire.opml`。
 
 每个 RSS 条目的链接都指向 `item.html?id=<稳定ID>`。页面只加载该条资料的分片 JSON，而不是在手机上下载整个历史库，并固定展示：内容是什么、问题、核心思想、支持核心思想的原文短句、机制、证据/结果、SSD 全链路位置、工程价值、阅读建议、局限和证据等级。原始摘要默认折叠，原文是页面内的独立按钮；页面同时标注整理模型、生成时间以及“AI 自动整理、未经人工全文复核”。
 
@@ -74,7 +74,7 @@ python3 radar.py build
 - GitHub Actions 使用内置 `GITHUB_TOKEN` 和 `models: read` 调用 GitHub Models，生成经过字段校验的中文专业简报，不需要另存模型 API Key；
 - 模型提示明确禁止使用标题猜测论文结论。无摘要/正文时，问题、核心思想、机制和结果会标记为“原页面未提供”；
 - 只有状态为 `professional` 且全部字段、证据原句、SSD 层级与数字声明通过校验的资料，才会进入 Live、完整 Feed、历史分卷和 WebSub 推送；该门槛同时适用于新增、更新和历史基线。网络、配额或校验失败时只留在待整理队列，按退避窗口自动重试；
-- 搜索面板保留完整历史目录，未完成条目只显示明确的“待整理”占位，不把模型失败内容伪装成结论。RSS 历史分卷按完整目录预先固定并可为空；专业回填通过后自动进入原分卷，用户一次导入 OPML 即可持续收到。证据等级会区分官方网页正文、官方摘要、来源摘要/摘录和仅元数据。
+- 搜索面板只展示滚动最近 5 年目录，未完成条目只显示明确的“待整理”占位，不把模型失败内容伪装成结论。RSS 历史分卷预先固定并可为空；专业回填通过后自动进入原分卷，用户一次导入 OPML 即可持续收到。证据等级会区分官方网页正文、官方摘要、来源摘要/摘录和仅元数据。
 
 OPML 中已经把订阅分成两个文件夹：
 
@@ -113,10 +113,12 @@ python3 radar.py build
 
 ## 历史范围与边界
 
-“全部历史”指源站或公开 API 目前仍提供、且系统实际执行过回溯的历史：
+公开历史是“滚动最近 5 年”，截止日每天前移，并在 `archive.json`、`status.json` 和同步报告中显式记录。规则是：
 
-- FAST、SAFARI 和 NVM Express 可以分页回溯；OpenAlex 会在首次基线时从 `history_start_date` 分页回溯；
-- OCP Groups.io 的公开 RSS 只提供最近 20 条。系统从首次同步开始永久保存后续条目，并在面板中提供完整邮件组入口；若将来提供 Groups.io API 凭据，可以再导入旧邮件归档；
+- 历史面板、历史 RSS 和专业回填按“最早已知首发日”判定；该日期只能在发现更早的可信记录时向前修正，无日期条目不进入历史快照；
+- 今天新发现但首发日已早于截止日的资料不会伪装成“新增”；老资料今天发生实质内容更新则仍会进入当天事件流；
+- SQLite 内部保留更旧的记录和版本证据，只用于去重和防止重复通知；它们不进入网页、RSS、OPML 历史或模型回填队列；
+- OCP Groups.io 的公开 RSS 只提供最近 20 条；没有 API Key 时从现在起持续跟踪；
 - 源站已经删除、从未公开或需要企业权限的资料无法凭 RSS 恢复；
 - OpenAlex 无法按“索引更新时间”做可靠增量，因此首次基线以后每天重扫最近一年。云端不会再做 25 年关键词月度全扫，以免超出免费搜索预算后在末页限流并丢掉整批结果；月度 `--full` 只用于有界的 FAST TOC 回扫。发布日期早于滚动窗口、但一年后才被 OpenAlex 补录的论文仍可能漏掉，因此 Scholar/IEEE 邮件提醒保留为补漏层。
 
@@ -138,7 +140,7 @@ python3 radar.py build
 - NetNewsWire 浏览器导入页：`site/import.html`
 - NetNewsWire 导入清单：`site/netnewswire.opml`（UTF-8 BOM，兼容缺少 charset 的静态托管响应）
 
-RSS 是首次基线后的“已完成专业整理的新增与实质更新事件流”，完整旧资料仍在历史面板和 `archive.json` 中。资料后续发生变化时，旧快照保存在 SQLite 的 `item_versions` 表，不会被新内容无痕覆盖；结构化简报保存在 `item_briefs` 表，原始来源内容与专业总结不会混为同一字段。
+RSS 是首次基线后的“已完成专业整理的新增与实质更新事件流”，历史面板和 `archive.json` 只保留滚动最近 5 年。资料后续发生变化时，旧快照保存在 SQLite 的 `item_versions` 表作为内部去重与核验证据，不会被新内容无痕覆盖；结构化简报保存在 `item_briefs` 表，原始来源内容与专业总结不会混为同一字段。
 
 论文优先按 DOI 去重；没有 DOI 时使用规范化标题和年份。网站文章和邮件按来源的稳定 ID 保存。新增来源第一次导入时自动建立自己的基线，不会制造历史通知洪水。待通知事件使用持久化 outbox：若程序在生成报告前退出，下次同步会再次交付，宁可重复一次也不会永久漏报。
 

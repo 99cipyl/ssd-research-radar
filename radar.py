@@ -37,6 +37,7 @@ from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tupl
 
 import briefs
 import item_page
+import retention
 
 
 ROOT = Path(__file__).resolve().parent
@@ -87,6 +88,7 @@ CREATE TABLE IF NOT EXISTS items (
     authors TEXT,
     venue TEXT,
     published_at TEXT,
+    original_published_at TEXT,
     summary TEXT,
     topics_json TEXT NOT NULL DEFAULT '[]',
     discovered_at TEXT NOT NULL,
@@ -142,6 +144,8 @@ CREATE TABLE IF NOT EXISTS run_events (
     created_at TEXT NOT NULL,
     delivered_at TEXT,
     websub_published_at TEXT,
+    suppressed_at TEXT,
+    suppression_reason TEXT,
     PRIMARY KEY (run_id, item_id, event_type)
 );
 """
@@ -390,6 +394,9 @@ def connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     briefs.ensure_schema(conn)
+    item_columns = {row[1] for row in conn.execute("PRAGMA table_info(items)")}
+    if "original_published_at" not in item_columns:
+        conn.execute("ALTER TABLE items ADD COLUMN original_published_at TEXT")
     # Existing installations created before periodic full rescans need a tiny
     # forward-only migration.  Treat the last successful baseline as a full
     # scan so upgrading does not immediately repeat a costly OpenAlex import.
@@ -410,6 +417,18 @@ def connect() -> sqlite3.Connection:
     if "websub_published_at" not in event_columns:
         conn.execute("ALTER TABLE run_events ADD COLUMN websub_published_at TEXT")
         conn.commit()
+    if "suppressed_at" not in event_columns:
+        conn.execute("ALTER TABLE run_events ADD COLUMN suppressed_at TEXT")
+    if "suppression_reason" not in event_columns:
+        conn.execute("ALTER TABLE run_events ADD COLUMN suppression_reason TEXT")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_items_original_published ON items(original_published_at DESC)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_run_events_public_outbox "
+        "ON run_events(suppressed_at,created_at,event_type,delivered_at,websub_published_at)"
+    )
+    conn.commit()
     # Seed one recoverable snapshot for databases created by earlier versions.
     # Future material changes append distinct hashes without overwriting these.
     conn.execute(
@@ -420,6 +439,22 @@ def connect() -> sqlite3.Connection:
         SELECT x.item_id,x.source_id,x.raw_hash,x.first_seen_at,
                i.title,COALESCE(x.source_url,i.url),i.published_at,i.summary
         FROM item_sources x JOIN items i ON i.id=x.item_id
+        """
+    )
+    # Preserve the earliest source-observed publication date so a later page
+    # modification cannot make old history look newly published and bypass the
+    # rolling retention window.  An initially undated item may acquire its
+    # first trustworthy date later.
+    conn.execute(
+        """
+        UPDATE items
+        SET original_published_at=COALESCE(
+            original_published_at,
+            (SELECT MIN(NULLIF(v.published_at,''))
+             FROM item_versions v WHERE v.item_id=items.id),
+            published_at
+        )
+        WHERE original_published_at IS NULL
         """
     )
     conn.commit()
@@ -606,6 +641,9 @@ def fetch_dblp(source: Dict[str, Any], full: bool, _since: Optional[str]) -> Lis
         toc_specs.append((int(year_text), volume_key, toc_path))
 
     toc_specs.sort(reverse=True)
+    if _since:
+        cutoff_year = int(_since[:4])
+        toc_specs = [spec for spec in toc_specs if spec[0] >= cutoff_year]
     if not full:
         # FAST is annual.  Re-reading the current and previous proceedings is
         # enough for prompt additions/corrections; a periodic full scan below
@@ -910,7 +948,7 @@ def wordpress_url(source: Dict[str, Any], page: int, full: bool, since: Optional
         "page": page,
         "_fields": "id,date_gmt,modified_gmt,link,title,excerpt",
     }
-    if not full and since:
+    if since:
         params.update({"orderby": "modified", "order": "desc", "modified_after": since})
     return f"{source['endpoint']}?{urllib.parse.urlencode(params)}"
 
@@ -923,8 +961,8 @@ def fetch_wordpress(source: Dict[str, Any], full: bool, since: Optional[str]) ->
         try:
             payload, headers = request_json(wordpress_url(source, page, full, since))
         except urllib.error.HTTPError as exc:
-            if exc.code == 400 and not full and since:
-                return fetch_wordpress(source, False, None)
+            if exc.code == 400 and since:
+                return fetch_wordpress(source, full, None)
             raise
         total_pages = int(headers.get("X-WP-TotalPages", "1"))
         for post in payload:
@@ -1171,6 +1209,13 @@ def preferred_value(old: Optional[str], new: Optional[str], prefer_longer: bool 
     return old
 
 
+def earliest_published_at(*values: Optional[str]) -> Optional[str]:
+    """Keep a monotonic earliest-known publication date for retention."""
+
+    candidates = [value for value in values if value]
+    return min(candidates) if candidates else None
+
+
 def merged_topics(existing_json: Optional[str], incoming: Sequence[str]) -> str:
     try:
         existing = json.loads(existing_json or "[]")
@@ -1206,6 +1251,7 @@ def ingest_record(
     source: Dict[str, Any],
     record: Dict[str, Any],
     notify: bool,
+    history_cutoff: Optional[str] = None,
 ) -> Tuple[bool, bool]:
     now = iso(utcnow())
     record["title"] = strip_html(record.get("title")) or "(untitled)"
@@ -1235,12 +1281,17 @@ def ingest_record(
             (now, record.get("url"), raw_hash, source["id"], external_id),
         )
         was_updated = existing_source["raw_hash"] != raw_hash
+        update_notify = False
         if was_updated:
             item = conn.execute("SELECT * FROM items WHERE id=?", (existing_source["item_id"],)).fetchone()
+            original_published_at = earliest_published_at(
+                item["original_published_at"], record.get("published_at")
+            )
             conn.execute(
                 """
                 UPDATE items SET
                     title=?, normalized_title=?, url=?, doi=?, authors=?, venue=?, published_at=?,
+                    original_published_at=?,
                     summary=?, topics_json=?, updated_at=?
                 WHERE id=?
                 """,
@@ -1252,17 +1303,27 @@ def ingest_record(
                     preferred_value(item["authors"], record.get("authors"), True),
                     record.get("venue") or item["venue"],
                     record.get("published_at") or item["published_at"],
+                    original_published_at,
                     record.get("summary") or item["summary"],
                     merged_topics(item["topics_json"], record["topics"]), now, item["id"],
                 ),
             )
-            if effective_notify:
+            update_notify = effective_notify and (
+                not history_cutoff
+                or retention.event_is_in_scope(
+                    "updated",
+                    original_published_at,
+                    now,
+                    history_cutoff,
+                )
+            )
+            if update_notify:
                 conn.execute(
                     "INSERT OR IGNORE INTO run_events(run_id,item_id,source_id,event_type,created_at) VALUES(?,?,?,?,?)",
                     (run_id, item["id"], source["id"], "updated", now),
                 )
         store_version(conn, int(existing_source["item_id"]), source["id"], raw_hash, now, record)
-        return False, bool(was_updated and effective_notify)
+        return False, bool(was_updated and update_notify)
 
     key = canonical_key(record, source["id"])
     item = conn.execute("SELECT * FROM items WHERE canonical_key=?", (key,)).fetchone()
@@ -1272,23 +1333,28 @@ def ingest_record(
             """
             INSERT INTO items(
                 canonical_key,item_type,title,normalized_title,url,doi,authors,venue,published_at,
-                summary,topics_json,discovered_at,updated_at,baseline
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                original_published_at,summary,topics_json,discovered_at,updated_at,baseline
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 key, record.get("item_type") or "post", record["title"], normalize_title(record["title"]),
                 record.get("url"), record.get("doi"), record.get("authors"), record.get("venue"),
-                record.get("published_at"), record.get("summary"),
+                record.get("published_at"), record.get("published_at"), record.get("summary"),
                 json.dumps(record["topics"], ensure_ascii=False), now, now, 0 if effective_notify else 1,
             ),
         )
         item_id = int(cursor.lastrowid)
     else:
         item_id = int(item["id"])
+        original_published_at = earliest_published_at(
+            item["original_published_at"], record.get("published_at")
+        )
         conn.execute(
             """
             UPDATE items SET
-                url=?, doi=?, authors=?, venue=?, published_at=?, summary=?, topics_json=?, updated_at=?
+                url=?, doi=?, authors=?, venue=?, published_at=?,
+                original_published_at=?,
+                summary=?, topics_json=?, updated_at=?
             WHERE id=?
             """,
             (
@@ -1297,6 +1363,7 @@ def ingest_record(
                 preferred_value(item["authors"], record.get("authors"), True),
                 preferred_value(item["venue"], record.get("venue")),
                 preferred_value(item["published_at"], record.get("published_at")),
+                original_published_at,
                 preferred_value(item["summary"], record.get("summary"), True),
                 merged_topics(item["topics_json"], record["topics"]), now, item_id,
             ),
@@ -1309,12 +1376,25 @@ def ingest_record(
         (source["id"], external_id, item_id, record.get("url"), raw_hash, now, now),
     )
     store_version(conn, item_id, source["id"], raw_hash, now, record)
-    if is_new and effective_notify:
+    original_published_at = record.get("published_at") if is_new else original_published_at
+    new_notify = bool(
+        is_new
+        and effective_notify
+        and (
+            not history_cutoff
+            or retention.event_is_in_scope(
+                "new", original_published_at, now, history_cutoff
+            )
+        )
+    )
+    if new_notify:
         conn.execute(
             "INSERT OR IGNORE INTO run_events(run_id,item_id,source_id,event_type,created_at) VALUES(?,?,?,?,?)",
             (run_id, item_id, source["id"], "new", now),
         )
-    return bool(is_new and effective_notify), False
+    if is_new and not new_notify:
+        conn.execute("UPDATE items SET baseline=1 WHERE id=?", (item_id,))
+    return new_notify, False
 
 
 def overlap_since(last_success: Optional[str], days: int = 3) -> Optional[str]:
@@ -1363,12 +1443,26 @@ def sync_source(conn: sqlite3.Connection, run_id: int, source: Dict[str, Any], f
     conn.commit()
     fetcher = FETCHERS[source["kind"]]
     records = fetcher(source, full, since)
+    history_cutoff = str(source.get("history_start_date") or "").strip() or None
+    if full and history_cutoff:
+        records = [
+            record
+            for record in records
+            if retention.record_is_in_scope(record, history_cutoff)
+        ]
     new_count = 0
     updated_count = 0
     conn.execute("BEGIN")
     try:
         for record in records:
-            is_new, is_updated = ingest_record(conn, run_id, source, record, notify=initialized)
+            is_new, is_updated = ingest_record(
+                conn,
+                run_id,
+                source,
+                record,
+                notify=initialized,
+                history_cutoff=history_cutoff,
+            )
             new_count += int(is_new)
             updated_count += int(is_updated)
         source_count = conn.execute(
@@ -1411,32 +1505,60 @@ def record_source_failure(conn: sqlite3.Connection, source_id: str, error: BaseE
     conn.commit()
 
 
-def item_rows(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+def item_rows(
+    conn: sqlite3.Connection, history_cutoff: Optional[str] = None
+) -> List[sqlite3.Row]:
     briefs.ensure_fallback_briefs(conn)
+    where = ""
+    parameters: List[Any] = []
+    if history_cutoff:
+        where = f"WHERE {retention.item_date_sql('i')}>=?"
+        parameters.append(history_cutoff)
     return conn.execute(
-        """
+        f"""
         SELECT i.*,
+               1 AS retention_eligible,
                b.public_id,b.status AS brief_status,b.model AS brief_model,
                b.brief_json,b.generated_at AS brief_generated_at,
                GROUP_CONCAT(DISTINCT s.name) AS source_names,
                GROUP_CONCAT(DISTINCT s.id) AS source_ids,
                (SELECT COUNT(*) FROM item_versions v WHERE v.item_id=i.id) AS version_count,
                (SELECT COUNT(*) FROM run_events e
-                WHERE e.item_id=i.id AND e.delivered_at IS NULL) AS pending_event_count,
+                WHERE e.item_id=i.id AND e.delivered_at IS NULL
+                  AND e.suppressed_at IS NULL) AS pending_event_count,
                (SELECT COUNT(*) FROM run_events e
-                WHERE e.item_id=i.id AND e.event_type='updated') AS update_event_count
+                WHERE e.item_id=i.id AND e.event_type='updated'
+                  AND e.suppressed_at IS NULL) AS update_event_count
         FROM items i
         JOIN item_sources x ON x.item_id=i.id
         JOIN sources s ON s.id=x.source_id
         JOIN item_briefs b ON b.item_id=i.id
+        {where}
         GROUP BY i.id
         ORDER BY COALESCE(i.published_at,i.discovered_at) DESC, i.id DESC
-        """
+        """,
+        parameters,
     ).fetchall()
 
 
-def source_rows(conn: sqlite3.Connection) -> List[sqlite3.Row]:
-    return conn.execute("SELECT * FROM sources ORDER BY name").fetchall()
+def source_rows(
+    conn: sqlite3.Connection, history_cutoff: Optional[str] = None
+) -> List[sqlite3.Row]:
+    if not history_cutoff:
+        return conn.execute(
+            "SELECT s.*,s.item_count AS window_item_count FROM sources s ORDER BY name"
+        ).fetchall()
+    return conn.execute(
+        f"""
+        SELECT s.*,
+               (SELECT COUNT(DISTINCT x.item_id)
+                FROM item_sources x JOIN items i ON i.id=x.item_id
+                WHERE x.source_id=s.id AND {retention.item_date_sql('i')}>=?)
+               AS window_item_count
+        FROM sources s ORDER BY s.name
+        """,
+        (history_cutoff,),
+    ).fetchall()
 
 
 def atomically_write(path: Path, content: str) -> None:
@@ -1451,8 +1573,23 @@ def atomically_write(path: Path, content: str) -> None:
             os.unlink(temp_name)
 
 
-def dashboard_html(items: List[Dict[str, Any]], sources: List[Dict[str, Any]], generated_at: str) -> str:
-    payload = json.dumps({"items": items, "sources": sources, "generated_at": generated_at}, ensure_ascii=False)
+def dashboard_html(
+    items: List[Dict[str, Any]],
+    sources: List[Dict[str, Any]],
+    generated_at: str,
+    history_window_years: int = retention.DEFAULT_HISTORY_WINDOW_YEARS,
+    history_cutoff: str = "",
+) -> str:
+    payload = json.dumps(
+        {
+            "items": items,
+            "sources": sources,
+            "generated_at": generated_at,
+            "history_window_years": history_window_years,
+            "history_cutoff": history_cutoff,
+        },
+        ensure_ascii=False,
+    )
     payload = payload.replace("<", "\\u003c")
     return f"""<!doctype html>
 <html lang="zh-CN">
@@ -1480,12 +1617,12 @@ footer{{color:var(--muted);font-size:13px;margin-top:24px}}
 </style>
 </head>
 <body>
-<header><h1>SSD Research Radar</h1><p>一个可搜索、可积累、可增量通知的 SSD / NAND / NVMe 资料库。数据库保留来源仍公开可访问的历史，并从首次同步起永久保存后续更新。</p></header>
+<header><h1>SSD Research Radar</h1><p>聚焦 SSD / NAND / NVMe 最近 {history_window_years} 年的专业简报，并优先整理从今天起的每日新增与实质更新。</p></header>
 <main>
-  <section class="stats"><div class="stat"><b id="total">0</b><span>历史资料</span></div><div class="stat"><b id="papers">0</b><span>论文</span></div><div class="stat"><b id="recent">0</b><span>近 30 天发布</span></div><div class="stat"><b id="healthy">0</b><span>来源正常</span></div></section>
+  <section class="stats"><div class="stat"><b id="total">0</b><span>近 {history_window_years} 年资料</span></div><div class="stat"><b id="papers">0</b><span>论文</span></div><div class="stat"><b id="recent">0</b><span>近 30 天发布</span></div><div class="stat"><b id="healthy">0</b><span>来源正常</span></div></section>
   <section class="controls"><input id="query" placeholder="搜索标题、作者、摘要……"><select id="topic"><option value="">全部主题</option></select><select id="source"><option value="">全部来源</option></select><select id="year"><option value="">全部年份</option></select></section>
   <div class="layout"><section><div id="items"></div><div class="pager"><button id="prev">上一页</button><span id="page"></span><button id="next">下一页</button></div></section><aside id="status" class="status"></aside></div>
-  <footer>生成时间：<span id="generated"></span>。绿色“新增”表示首次基线以后发现的资料；历史基线不会触发通知。</footer>
+  <footer>公开历史起点：{history_cutoff or '未限制'}；生成时间：<span id="generated"></span>。旧记录仅在内部用于去重和版本核验，不会当作新资料推送。</footer>
 </main>
 <script id="radar-data" type="application/json">{payload}</script>
 <script>
@@ -1588,7 +1725,7 @@ def rss_xml(
     ET.SubElement(channel, "title").text = channel_title
     ET.SubElement(channel, "link").text = base
     ET.SubElement(channel, "description").text = (
-        "SSD / NAND / NVMe 历史资料归档" if archive
+        "SSD / NAND / NVMe 最近 5 年专业资料归档" if archive
         else "SSD / NAND / NVMe 新增与实质更新"
     )
     ET.SubElement(channel, "language").text = "zh-CN"
@@ -1609,8 +1746,12 @@ def rss_xml(
             "brief_status" not in row.keys()
             or row["brief_status"] != "professional"
             or "brief_json" not in row.keys()
+            or "retention_eligible" not in row.keys()
+            or int(row["retention_eligible"] or 0) != 1
         ):
-            raise ValueError("RSS rows must have a validated professional brief")
+            raise ValueError(
+                "RSS rows must be retention-eligible and have a validated professional brief"
+            )
         professional_brief = briefs.parse_brief(row["brief_json"])
         event_type = row["event_type"] if "event_type" in row.keys() else "new"
         item = ET.SubElement(channel, "item")
@@ -1665,6 +1806,8 @@ def archive_feed_specs(rows: Sequence[sqlite3.Row]) -> List[Tuple[str, str, List
         if (
             "brief_status" not in row.keys()
             or row["brief_status"] != "professional"
+            or "retention_eligible" not in row.keys()
+            or int(row["retention_eligible"] or 0) != 1
         ):
             continue
         stable_key = (
@@ -1687,7 +1830,7 @@ def archive_feed_specs(rows: Sequence[sqlite3.Row]) -> List[Tuple[str, str, List
         )
         filename = f"professional-archive-{number:02d}.xml"
         label = (
-            "SSD Research Radar 专业简报历史"
+            "SSD Research Radar 最近 5 年专业简报"
             f" · 固定分片 {number:02d}/{ARCHIVE_BUCKET_COUNT}"
         )
         specs.append((filename, label, ordered))
@@ -1755,7 +1898,7 @@ def opml_import_html(archive_count: int, *, base_url: Optional[str] = None) -> s
   <main>
     <div class="eyebrow">NETNEWSWIRE · OPML</div>
     <h1>下载后导入，不需要阅读 XML</h1>
-    <p>OPML 是订阅清单，不是普通网页。它包含一个实时更新 Feed 和 {archive_count} 个固定的专业简报历史 Feed。</p>
+    <p>OPML 是订阅清单，不是普通网页。它包含一个实时更新 Feed 和 {archive_count} 个固定的最近 5 年专业简报 Feed。</p>
     <a class="button" href="{opml_url}" download="SSD-Research-Radar.opml">下载 UTF-8 OPML 文件</a>
     <a class="secondary" href="{live_url}">只订阅后续更新 →</a>
     <ol>
@@ -1764,48 +1907,85 @@ def opml_import_html(archive_count: int, *, base_url: Optional[str] = None) -> s
       <li>选择刚下载的 <strong>SSD-Research-Radar.opml</strong>。</li>
       <li>只给“SSD 即时更新”文件夹开启通知；历史简报保持关闭通知。</li>
     </ol>
-    <aside>历史资料只有完成专业整理并通过证据校验后才会出现在这些固定 Feed 中；后台回填时会自动增加。若你导入过旧版“SSD 历史归档”，请先删除那个旧文件夹，再导入本文件一次，以清除阅读器缓存；此后无需再次导入。若浏览器显示 XML，长按“下载”按钮并选择“下载链接文件”。</aside>
+    <aside>服务器只保留滚动最近 5 年的历史订阅内容；资料只有完成专业整理并通过证据校验后才会出现。已被阅读器缓存的更旧条目无法由服务器远程删除。若你导入过旧版“SSD 历史归档”，请先删除那个旧文件夹，再导入本文件一次；此后无需再次导入。若浏览器显示 XML，长按“下载”按钮并选择“下载链接文件”。</aside>
   </main>
 </body>
 </html>
 """
 
 
-def live_event_rows(conn: sqlite3.Connection) -> List[sqlite3.Row]:
+def suppress_out_of_scope_events(conn: sqlite3.Connection, history_cutoff: str) -> int:
+    """Remove expired or late-discovered old items from durable outboxes."""
+
+    cursor = conn.execute(
+        f"""
+        UPDATE run_events
+        SET suppressed_at=?,suppression_reason='outside_retention_window'
+        WHERE suppressed_at IS NULL
+          AND (
+              SUBSTR(created_at,1,10)<?
+              OR (
+                  event_type='new'
+                  AND EXISTS(
+                      SELECT 1 FROM items i
+                      WHERE i.id=run_events.item_id
+                        AND {retention.item_date_sql('i')} IS NOT NULL
+                        AND {retention.item_date_sql('i')}<?
+                  )
+              )
+          )
+        """,
+        (iso(utcnow()), history_cutoff, history_cutoff),
+    )
+    conn.commit()
+    return max(0, int(cursor.rowcount))
+
+
+def live_event_rows(
+    conn: sqlite3.Connection, history_cutoff: str
+) -> List[sqlite3.Row]:
     briefs.ensure_fallback_briefs(conn)
     briefs.validate_professional_briefs(conn)
     pending = conn.execute(
         """
-        SELECT i.*,b.public_id,b.status AS brief_status,b.model AS brief_model,
+        SELECT i.*,1 AS retention_eligible,
+               b.public_id,b.status AS brief_status,b.model AS brief_model,
                b.brief_json,b.generated_at AS brief_generated_at,
                e.run_id,e.event_type,e.created_at AS event_created_at
         FROM run_events e JOIN items i ON i.id=e.item_id
         JOIN item_briefs b ON b.item_id=i.id
-        WHERE e.websub_published_at IS NULL AND b.status='professional'
+        WHERE e.websub_published_at IS NULL AND e.suppressed_at IS NULL
+          AND SUBSTR(e.created_at,1,10)>=? AND b.status='professional'
         ORDER BY e.created_at DESC,e.run_id DESC LIMIT ?
         """,
-        (MAX_FEED_ITEMS,),
+        (history_cutoff, MAX_FEED_ITEMS),
     ).fetchall()
     if pending:
         return pending
     return conn.execute(
         """
-        SELECT i.*,b.public_id,b.status AS brief_status,b.model AS brief_model,
+        SELECT i.*,1 AS retention_eligible,
+               b.public_id,b.status AS brief_status,b.model AS brief_model,
                b.brief_json,b.generated_at AS brief_generated_at,
                e.run_id,e.event_type,e.created_at AS event_created_at
         FROM run_events e JOIN items i ON i.id=e.item_id
         JOIN item_briefs b ON b.item_id=i.id AND b.status='professional'
+        WHERE e.suppressed_at IS NULL AND SUBSTR(e.created_at,1,10)>=?
         ORDER BY e.created_at DESC,e.run_id DESC LIMIT ?
         """,
-        (MAX_FEED_ITEMS,),
+        (history_cutoff, MAX_FEED_ITEMS),
     ).fetchall()
 
 
-def write_mobile_feeds(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) -> None:
+def write_mobile_feeds(
+    conn: sqlite3.Connection,
+    rows: Sequence[sqlite3.Row],
+    history_cutoff: str,
+) -> None:
     base = normalize_public_base_url()
     hub = os.environ.get("RADAR_WEBSUB_HUB", "").strip() or None
     live = rss_xml(
-        live_event_rows(conn), feed_path="live.xml", channel_title="SSD Research Radar · Live",
+        live_event_rows(conn, history_cutoff), feed_path="live.xml", channel_title="SSD Research Radar · Live",
         base_url=base, hub_url=hub,
     )
     atomically_write(SITE_DIR / "live.xml", live)
@@ -1833,12 +2013,16 @@ def write_mobile_feeds(conn: sqlite3.Connection, rows: Sequence[sqlite3.Row]) ->
     atomically_write(SITE_DIR / "import.html", opml_import_html(len(archive_specs), base_url=base))
 
 
-def build_site(conn: sqlite3.Connection) -> None:
+def build_site(
+    conn: sqlite3.Connection,
+    history_cutoff: Optional[str] = None,
+    history_window_years: int = retention.DEFAULT_HISTORY_WINDOW_YEARS,
+) -> None:
     SITE_DIR.mkdir(parents=True, exist_ok=True)
     briefs.ensure_fallback_briefs(conn)
     briefs.validate_professional_briefs(conn)
-    rows = item_rows(conn)
-    sources = source_rows(conn)
+    rows = item_rows(conn, history_cutoff)
+    sources = source_rows(conn, history_cutoff)
     items: List[Dict[str, Any]] = []
     for row in rows:
         brief = row_brief(row)
@@ -1856,16 +2040,48 @@ def build_site(conn: sqlite3.Connection) -> None:
             "source_ids": (row["source_ids"] or "").split(","), "baseline": bool(row["baseline"]),
             "version_count": row["version_count"],
         })
-    source_payload = [
-        {key: row[key] for key in ("id", "name", "category", "homepage", "last_success_at", "last_error", "item_count")}
-        for row in sources
-    ]
+    source_payload = []
+    for row in sources:
+        payload = {
+            key: row[key]
+            for key in ("id", "name", "category", "homepage", "last_success_at", "last_error")
+        }
+        payload["item_count"] = int(row["window_item_count"] or 0)
+        source_payload.append(payload)
     generated = iso(utcnow())
-    item_page.export_item_pages(conn, SITE_DIR, normalize_public_base_url())
-    atomically_write(SITE_DIR / "index.html", dashboard_html(items, source_payload, generated))
-    write_mobile_feeds(conn, rows)
+    public_item_ids = {int(row["id"]) for row in rows}
+    live_cutoff = history_cutoff or "0001-01-01"
+    public_item_ids.update(
+        int(row[0])
+        for row in conn.execute(
+            """
+            SELECT DISTINCT item_id FROM run_events
+            WHERE suppressed_at IS NULL AND SUBSTR(created_at,1,10)>=?
+            """,
+            (live_cutoff,),
+        )
+    )
+    item_page.export_item_pages(
+        conn,
+        SITE_DIR,
+        normalize_public_base_url(),
+        item_ids=sorted(public_item_ids),
+    )
+    atomically_write(
+        SITE_DIR / "index.html",
+        dashboard_html(
+            items,
+            source_payload,
+            generated,
+            history_window_years=history_window_years,
+            history_cutoff=history_cutoff or "",
+        ),
+    )
+    write_mobile_feeds(conn, rows, live_cutoff)
     archive = {
         "generated_at": generated,
+        "history_window_years": history_window_years,
+        "history_cutoff": history_cutoff,
         "item_count": len(items),
         "items": items,
         "sources": source_payload,
@@ -1904,7 +2120,9 @@ def publish_websub(hub_url: str, topic_url: str, retries: int = 3) -> None:
     raise RuntimeError(f"WebSub publish failed: {last_error}")
 
 
-def publish_pending_websub(conn: sqlite3.Connection) -> List[str]:
+def publish_pending_websub(
+    conn: sqlite3.Connection, history_cutoff: Optional[str] = None
+) -> List[str]:
     """Publish one durable event batch; leave it pending if the hub fails."""
     briefs.ensure_fallback_briefs(conn)
     briefs.validate_professional_briefs(conn)
@@ -1914,14 +2132,21 @@ def publish_pending_websub(conn: sqlite3.Connection) -> List[str]:
     base = configured_public_base_url()
     if not base:
         return ["已设置 RADAR_WEBSUB_HUB，但未设置 RADAR_PUBLIC_BASE_URL；已跳过 WebSub 推送"]
+    cutoff_clause = ""
+    parameters: List[Any] = []
+    if history_cutoff:
+        cutoff_clause = "AND SUBSTR(e.created_at,1,10)>=?"
+        parameters.append(history_cutoff)
+    parameters.append(MAX_FEED_ITEMS)
     rows = conn.execute(
-        """
+        f"""
         SELECT e.run_id,e.item_id,e.event_type
         FROM run_events e JOIN item_briefs b ON b.item_id=e.item_id
-        WHERE e.websub_published_at IS NULL AND b.status='professional'
+        WHERE e.websub_published_at IS NULL AND e.suppressed_at IS NULL
+          AND b.status='professional' {cutoff_clause}
         ORDER BY e.created_at DESC,e.run_id DESC LIMIT ?
         """,
-        (MAX_FEED_ITEMS,),
+        parameters,
     ).fetchall()
     if not rows:
         return []
@@ -1941,27 +2166,42 @@ def publish_pending_websub(conn: sqlite3.Connection) -> List[str]:
     )
     conn.commit()
     remaining = conn.execute(
-        "SELECT COUNT(*) FROM run_events WHERE websub_published_at IS NULL"
+        f"""
+        SELECT COUNT(*) FROM run_events e
+        WHERE e.websub_published_at IS NULL AND e.suppressed_at IS NULL
+          {cutoff_clause}
+        """,
+        parameters[:-1],
     ).fetchone()[0]
     if remaining:
         return [f"WebSub 已发布 {len(rows)} 条；另有 {remaining} 条积压事件将在后续同步继续发布"]
     return []
 
 
-def pending_event_rows(conn: sqlite3.Connection, event_type: str) -> List[sqlite3.Row]:
+def pending_event_rows(
+    conn: sqlite3.Connection,
+    event_type: str,
+    history_cutoff: Optional[str] = None,
+) -> List[sqlite3.Row]:
     briefs.ensure_fallback_briefs(conn)
     briefs.validate_professional_briefs(conn)
+    cutoff_clause = ""
+    parameters: List[Any] = [event_type]
+    if history_cutoff:
+        cutoff_clause = "AND SUBSTR(e.created_at,1,10)>=?"
+        parameters.append(history_cutoff)
     return conn.execute(
-        """
+        f"""
         SELECT i.*,s.name AS event_source,b.public_id,b.status AS brief_status,
                b.model AS brief_model,b.brief_json,b.generated_at AS brief_generated_at,
                e.run_id,e.created_at AS event_created_at
         FROM run_events e JOIN items i ON i.id=e.item_id JOIN sources s ON s.id=e.source_id
         JOIN item_briefs b ON b.item_id=i.id
-        WHERE e.delivered_at IS NULL AND e.event_type=? AND b.status='professional'
+        WHERE e.delivered_at IS NULL AND e.suppressed_at IS NULL
+          AND e.event_type=? AND b.status='professional' {cutoff_clause}
         ORDER BY COALESCE(i.published_at,i.discovered_at) DESC
         """,
-        (event_type,),
+        parameters,
     ).fetchall()
 
 
@@ -1975,7 +2215,8 @@ def requeue_unprofessional_events(conn: sqlite3.Connection) -> int:
         WHERE EXISTS(
             SELECT 1 FROM item_briefs b
             WHERE b.item_id=run_events.item_id AND b.status!='professional'
-        )
+          )
+          AND suppressed_at IS NULL
           AND (delivered_at IS NOT NULL OR websub_published_at IS NOT NULL)
         """
     )
@@ -1989,12 +2230,14 @@ def report_payload(
     source_results: List[Dict[str, Any]],
     warnings: Optional[List[str]] = None,
     brief_failures: Optional[List[Dict[str, Any]]] = None,
+    history_cutoff: Optional[str] = None,
+    history_window_years: int = retention.DEFAULT_HISTORY_WINDOW_YEARS,
 ) -> Dict[str, Any]:
     # Read from the persistent outbox, not only this run.  If a prior process
     # exited after ingesting records but before writing latest.json, those
     # events are retried here instead of being silently lost.
-    new_rows = pending_event_rows(conn, "new")
-    updated_rows = pending_event_rows(conn, "updated")
+    new_rows = pending_event_rows(conn, "new", history_cutoff)
+    updated_rows = pending_event_rows(conn, "updated", history_cutoff)
     source_failures = [result for result in source_results if not result.get("ok")]
     brief_generation_failures = list(brief_failures or [])
     failures = [*source_failures, *brief_generation_failures]
@@ -2022,20 +2265,34 @@ def report_payload(
             "brief_status": row["brief_status"],
         }
 
+    event_cutoff_clause = ""
+    event_parameters: List[Any] = []
+    if history_cutoff:
+        event_cutoff_clause = "AND SUBSTR(e.created_at,1,10)>=?"
+        event_parameters.append(history_cutoff)
     awaiting_briefs = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) FROM run_events e
         LEFT JOIN item_briefs b ON b.item_id=e.item_id
-        WHERE e.delivered_at IS NULL AND COALESCE(b.status,'fallback')!='professional'
-        """
+        WHERE e.delivered_at IS NULL AND e.suppressed_at IS NULL
+          AND COALESCE(b.status,'fallback')!='professional' {event_cutoff_clause}
+        """,
+        event_parameters,
     ).fetchone()[0]
+    history_clause = ""
+    history_parameters: List[Any] = []
+    if history_cutoff:
+        history_clause = f"WHERE {retention.item_date_sql('i')}>=?"
+        history_parameters.append(history_cutoff)
     brief_counts = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) AS total,
-               SUM(CASE WHEN status='professional' THEN 1 ELSE 0 END) AS professional,
-               SUM(CASE WHEN status='retry' THEN 1 ELSE 0 END) AS retry
-        FROM item_briefs
-        """
+               SUM(CASE WHEN b.status='professional' THEN 1 ELSE 0 END) AS professional,
+               SUM(CASE WHEN b.status='retry' THEN 1 ELSE 0 END) AS retry
+        FROM item_briefs b JOIN items i ON i.id=b.item_id
+        {history_clause}
+        """,
+        history_parameters,
     ).fetchone()
     total_items = int(brief_counts["total"] or 0)
     professional_items = int(brief_counts["professional"] or 0)
@@ -2049,6 +2306,8 @@ def report_payload(
         combined_warnings.append(f"{awaiting_briefs} 条新增/更新正在等待专业简报，生成成功前不会推送")
     return {
         "run_id": run_id,
+        "history_window_years": history_window_years,
+        "history_cutoff": history_cutoff,
         # Professional-brief rejection is deliberately fail-closed: the item
         # stays out of every feed and is retried.  It is an important health
         # signal, but it is not a source-ingestion or deployment failure and
@@ -2129,7 +2388,8 @@ def sync_lock() -> Iterator[None]:
 
 def run_sync(force_full: bool = False, report_format: str = "markdown", max_report_items: int = 30) -> Dict[str, Any]:
     config = load_config()
-    history_start = config.get("history_start_date", "2000-01-01")
+    history_start = retention.history_cutoff(config)
+    window_years = retention.history_window_years(config)
     overlap_days = int(config.get("incremental_overlap_days", 365))
     with sync_lock():
         conn = connect()
@@ -2158,10 +2418,17 @@ def run_sync(force_full: bool = False, report_format: str = "markdown", max_repo
                 record_source_failure(conn, source["id"], exc)
                 result = {"id": source["id"], "name": source["name"], "ok": False, "error": f"{type(exc).__name__}: {exc}"}
             source_results.append(result)
+        suppress_out_of_scope_events(conn, history_start)
         successful = sum(1 for result in source_results if result.get("ok"))
         failed = len(source_results) - successful
-        new_count = conn.execute("SELECT COUNT(*) FROM run_events WHERE run_id=? AND event_type='new'", (run_id,)).fetchone()[0]
-        updated_count = conn.execute("SELECT COUNT(*) FROM run_events WHERE run_id=? AND event_type='updated'", (run_id,)).fetchone()[0]
+        new_count = conn.execute(
+            "SELECT COUNT(*) FROM run_events WHERE run_id=? AND event_type='new' AND suppressed_at IS NULL",
+            (run_id,),
+        ).fetchone()[0]
+        updated_count = conn.execute(
+            "SELECT COUNT(*) FROM run_events WHERE run_id=? AND event_type='updated' AND suppressed_at IS NULL",
+            (run_id,),
+        ).fetchone()[0]
         conn.execute(
             """
             UPDATE runs SET finished_at=?,status=?,successful_sources=?,failed_sources=?,new_count=?,updated_count=? WHERE id=?
@@ -2183,13 +2450,14 @@ def run_sync(force_full: bool = False, report_format: str = "markdown", max_repo
                 """
                 SELECT e.item_id FROM run_events e
                 JOIN item_briefs b ON b.item_id=e.item_id
-                WHERE e.delivered_at IS NULL AND b.status!='professional'
+                WHERE e.delivered_at IS NULL AND e.suppressed_at IS NULL
+                  AND SUBSTR(e.created_at,1,10)>=? AND b.status!='professional'
                   AND (b.status!='retry' OR b.last_attempt_at IS NULL OR b.last_attempt_at<=?)
                 GROUP BY e.item_id
-                ORDER BY MIN(e.created_at),e.item_id
+                ORDER BY MAX(e.created_at) DESC,e.item_id
                 LIMIT 12
                 """,
-                (brief_retry_cutoff,),
+                (history_start, brief_retry_cutoff),
             )
         ]
         brief_warnings: List[str] = []
@@ -2208,6 +2476,7 @@ def run_sync(force_full: bool = False, report_format: str = "markdown", max_repo
                 or briefs.DEFAULT_MODEL,
                 priority_item_ids=priority_item_ids,
                 history_limit=history_limit,
+                history_start_date=history_start,
                 batch_size=max(1, int(os.environ.get("RADAR_BRIEF_BATCH_SIZE", "4") or 4)),
                 retry_after_seconds=brief_retry_seconds,
                 time_budget_seconds=max(
@@ -2252,14 +2521,16 @@ def run_sync(force_full: bool = False, report_format: str = "markdown", max_repo
         demoted = briefs.validate_professional_briefs(conn)
         if demoted:
             brief_warnings.append(f"发现 {demoted} 条旧专业简报结构失效，已停止发布并重新排队")
-        build_site(conn)
-        websub_warnings = publish_pending_websub(conn)
+        build_site(conn, history_start, window_years)
+        websub_warnings = publish_pending_websub(conn, history_start)
         payload = report_payload(
             conn,
             run_id,
             source_results,
             warnings=[*brief_warnings, *websub_warnings],
             brief_failures=brief_failures,
+            history_cutoff=history_start,
+            history_window_years=window_years,
         )
         report_text = markdown_report(payload, max_report_items)
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2272,13 +2543,14 @@ def run_sync(force_full: bool = False, report_format: str = "markdown", max_repo
         conn.execute(
             """
             UPDATE run_events SET delivered_at=?
-            WHERE delivered_at IS NULL
+            WHERE delivered_at IS NULL AND suppressed_at IS NULL
+              AND SUBSTR(created_at,1,10)>=?
               AND EXISTS(
                   SELECT 1 FROM item_briefs b
                   WHERE b.item_id=run_events.item_id AND b.status='professional'
               )
             """,
-            (iso(utcnow()),),
+            (iso(utcnow()), history_start),
         )
         conn.commit()
         conn.close()
@@ -2290,29 +2562,48 @@ def run_sync(force_full: bool = False, report_format: str = "markdown", max_repo
 
 
 def command_build(_args: argparse.Namespace) -> int:
+    config = load_config()
+    cutoff = retention.history_cutoff(config)
     conn = connect()
-    build_site(conn)
+    suppress_out_of_scope_events(conn, cutoff)
+    build_site(conn, cutoff, retention.history_window_years(config))
     conn.close()
     print(SITE_DIR / "index.html")
     return 0
 
 
 def command_stats(_args: argparse.Namespace) -> int:
+    config = load_config()
+    cutoff = retention.history_cutoff(config)
     conn = connect()
-    register_sources(conn, load_config())
-    total = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-    papers = conn.execute("SELECT COUNT(*) FROM items WHERE item_type='paper'").fetchone()[0]
-    print(f"历史资料: {total}\n论文: {papers}\n数据库: {DB_PATH}\n面板: {SITE_DIR / 'index.html'}")
-    for row in source_rows(conn):
+    register_sources(conn, config)
+    date_expression = retention.item_date_sql("i")
+    total = conn.execute(
+        f"SELECT COUNT(*) FROM items i WHERE {date_expression}>=?", (cutoff,)
+    ).fetchone()[0]
+    papers = conn.execute(
+        f"SELECT COUNT(*) FROM items i WHERE i.item_type='paper' AND {date_expression}>=?",
+        (cutoff,),
+    ).fetchone()[0]
+    stored = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+    print(
+        f"近 {retention.history_window_years(config)} 年资料: {total}\n"
+        f"论文: {papers}\n内部去重记录: {stored}\n公开起点: {cutoff}\n"
+        f"数据库: {DB_PATH}\n面板: {SITE_DIR / 'index.html'}"
+    )
+    for row in source_rows(conn, cutoff):
         state = "OK" if not row["last_error"] else "ERROR"
-        print(f"{state}\t{row['name']}\t{row['item_count']}\t{row['last_success_at'] or '-'}\t{row['last_error'] or ''}")
+        print(f"{state}\t{row['name']}\t{row['window_item_count']}\t{row['last_success_at'] or '-'}\t{row['last_error'] or ''}")
     conn.close()
     return 0
 
 
 def command_doctor(_args: argparse.Namespace) -> int:
+    config = load_config()
+    cutoff = retention.history_cutoff(config)
     conn = connect()
-    register_sources(conn, load_config())
+    register_sources(conn, config)
+    suppress_out_of_scope_events(conn, cutoff)
     briefs.validate_professional_briefs(conn)
     problems: List[str] = []
     integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
@@ -2321,12 +2612,12 @@ def command_doctor(_args: argparse.Namespace) -> int:
     running = conn.execute("SELECT COUNT(*) FROM runs WHERE status='running'").fetchone()[0]
     if running:
         problems.append(f"存在 {running} 个未完成同步；下次 sync 会恢复其待通知事件")
-    for row in source_rows(conn):
+    for row in source_rows(conn, cutoff):
         if not row["initialized"]:
             problems.append(f"{row['name']}: 尚未完成首次基线")
         if row["last_error"]:
             problems.append(f"{row['name']}: {row['last_error']}")
-    db_count = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+    db_count = len(item_rows(conn, cutoff))
     archive_path = SITE_DIR / "archive.json"
     if archive_path.exists():
         try:
@@ -2380,17 +2671,21 @@ def command_doctor(_args: argparse.Namespace) -> int:
                 if xml_local_name(node.tag) == "item"
             )
             baseline_publishable = conn.execute(
-                """
+                f"""
                 SELECT COUNT(*) FROM items i JOIN item_briefs b ON b.item_id=i.id
                 WHERE i.baseline=1 AND b.status='professional'
-                """
+                  AND {retention.item_date_sql('i')}>=?
+                """,
+                (cutoff,),
             ).fetchone()[0]
             professional_events = conn.execute(
                 """
                 SELECT COUNT(*) FROM run_events e
                 JOIN item_briefs b ON b.item_id=e.item_id
-                WHERE b.status='professional'
-                """
+                WHERE b.status='professional' AND e.suppressed_at IS NULL
+                  AND SUBSTR(e.created_at,1,10)>=?
+                """,
+                (cutoff,),
             ).fetchone()[0]
             expected_full = int(baseline_publishable) + int(professional_events)
             if full_count != expected_full:
@@ -2418,7 +2713,7 @@ def command_doctor(_args: argparse.Namespace) -> int:
         except (ET.ParseError, OSError) as exc:
             problems.append(f"{archive_feed.name}: {exc}")
     expected_archived_items = sum(
-        len(chunk) for _filename, _label, chunk in archive_feed_specs(item_rows(conn))
+        len(chunk) for _filename, _label, chunk in archive_feed_specs(item_rows(conn, cutoff))
     )
     if archived_items != expected_archived_items:
         problems.append(
@@ -2477,7 +2772,9 @@ def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="SSD Research Radar")
     sub = parser.add_subparsers(dest="command", required=True)
     sync = sub.add_parser("sync", help="同步所有来源并输出增量报告")
-    sync.add_argument("--full", action="store_true", help="强制重新扫描完整历史")
+    sync.add_argument(
+        "--full", action="store_true", help="强制重新扫描滚动最近 5 年范围"
+    )
     sync.add_argument("--format", choices=("markdown", "json"), default="markdown")
     sync.add_argument("--max-report-items", type=int, default=30)
     sub.add_parser("build", help="从数据库重新生成面板与 RSS")

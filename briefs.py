@@ -27,6 +27,7 @@ import urllib.request
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import evidence
+import retention
 
 
 GITHUB_MODELS_ENDPOINT = "https://models.github.ai/inference/chat/completions"
@@ -598,6 +599,7 @@ def _candidate_rows(
     priority_item_ids: Sequence[int],
     history_limit: int,
     retry_after_seconds: int,
+    history_start_date: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     priority = list(dict.fromkeys(int(item_id) for item_id in priority_item_ids))
     selected: List[Dict[str, Any]] = []
@@ -641,6 +643,10 @@ def _candidate_rows(
                     ",".join("?" for _ in excluded)
                 )
                 parameters.extend(sorted(excluded))
+            history_scope = ""
+            if history_start_date:
+                history_scope = f"AND {retention.item_date_sql('i')}>=?"
+                parameters.append(history_start_date)
             parameters.extend([cutoff, limit])
             return _dict_rows(
                 conn.execute(
@@ -651,7 +657,7 @@ def _candidate_rows(
                            (SELECT GROUP_CONCAT(DISTINCT x.source_id)
                             FROM item_sources x WHERE x.item_id=i.id) AS source_ids
                     FROM items i JOIN item_briefs b ON b.item_id=i.id
-                    WHERE {status_clause} {exclusion}
+                    WHERE {status_clause} {exclusion} {history_scope}
                       AND (b.status!='retry' OR b.last_attempt_at IS NULL OR b.last_attempt_at<=?)
                     ORDER BY COALESCE(i.published_at,'') DESC,
                              COALESCE(i.discovered_at,'') DESC,i.id DESC
@@ -1731,6 +1737,7 @@ def generate_professional_briefs(
     model: str = DEFAULT_MODEL,
     priority_item_ids: Sequence[int] = (),
     history_limit: int = 0,
+    history_start_date: Optional[str] = None,
     *,
     batch_size: int = 4,
     timeout: int = 90,
@@ -1761,7 +1768,13 @@ def generate_professional_briefs(
         retry_after_seconds,
         max(0, int(max_priority_items)),
     )
-    candidates = _candidate_rows(conn, priority, history_limit, retry_after_seconds)
+    candidates = _candidate_rows(
+        conn,
+        priority,
+        history_limit,
+        retry_after_seconds,
+        history_start_date,
+    )
     result: Dict[str, Any] = {
         "requested": len(candidates),
         "generated": 0,

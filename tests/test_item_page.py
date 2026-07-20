@@ -180,6 +180,9 @@ class ItemPageExportTests(unittest.TestCase):
             self.assertEqual(payload["brief"]["model"], "openai/gpt-4.1-mini")
             self.assertEqual(payload["brief"]["generated_at"], "2026-07-19T02:00:00Z")
             self.assertEqual(
+                payload["original_published_at"], "2026-02-01T00:00:00Z"
+            )
+            self.assertEqual(
                 payload["brief"]["content"]["supporting_quote"],
                 "The method schedules GC in idle windows.",
             )
@@ -271,6 +274,173 @@ class ItemPageExportTests(unittest.TestCase):
         self.assertIn("未依据标题推断", payload["brief"]["content"]["evidence_level"])
         self.assertIn("尚未完成专业整理", payload["brief"]["content"]["one_liner"])
         self.assertIn("原页面未提供", payload["brief"]["content"]["supporting_quote"])
+        connection.close()
+
+    def test_item_filter_limits_related_rows_and_cleans_only_generated_shards(self):
+        connection = database(with_briefs=False)
+        connection.execute("INSERT INTO runs VALUES(1,'2026-07-19T00:00:00Z','ok')")
+        item_ids = []
+        canonical_keys = []
+        for number in (1, 2):
+            canonical_key = f"source:filtered:{number}"
+            canonical_keys.append(canonical_key)
+            item_id = connection.execute(
+                """
+                INSERT INTO items(
+                    canonical_key,item_type,title,normalized_title,url,doi,authors,venue,
+                    published_at,summary,topics_json,discovered_at,updated_at,baseline
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    canonical_key,
+                    "paper",
+                    f"Filtered paper {number}",
+                    f"filtered paper {number}",
+                    f"https://paper.example/{number}",
+                    None,
+                    f"Author {number}",
+                    "FAST",
+                    f"202{number}-02-01T00:00:00Z",
+                    f"Summary {number}",
+                    "[]",
+                    "2026-07-19T00:00:00Z",
+                    "2026-07-19T01:00:00Z",
+                    1,
+                ),
+            ).lastrowid
+            item_ids.append(item_id)
+            connection.execute(
+                "INSERT INTO item_sources VALUES(?,?,?,?,?,?,?)",
+                (
+                    "fast",
+                    f"paper-{number}",
+                    item_id,
+                    f"https://source.example/paper-{number}",
+                    f"hash-{number}",
+                    "2026-07-19T00:00:00Z",
+                    "2026-07-19T01:00:00Z",
+                ),
+            )
+            connection.execute(
+                "INSERT INTO item_versions VALUES(?,?,?,?,?,?,?,?)",
+                (
+                    item_id,
+                    "fast",
+                    f"hash-{number}",
+                    "2026-07-19T01:00:00Z",
+                    f"Version {number}",
+                    f"https://source.example/paper-{number}",
+                    f"202{number}-02-01T00:00:00Z",
+                    f"Summary {number}",
+                ),
+            )
+            connection.execute(
+                "INSERT INTO run_events VALUES(?,?,?,?,?,?,?)",
+                (
+                    1,
+                    item_id,
+                    "fast",
+                    "updated",
+                    f"2026-07-19T0{number}:00:00Z",
+                    None,
+                    None,
+                ),
+            )
+        connection.execute("ALTER TABLE run_events ADD COLUMN suppressed_at TEXT")
+        connection.execute(
+            """
+            INSERT INTO run_events(
+                run_id,item_id,source_id,event_type,created_at,delivered_at,
+                websub_published_at,suppressed_at
+            ) VALUES(?,?,?,?,?,?,?,?)
+            """,
+            (
+                1,
+                item_ids[0],
+                "fast",
+                "new",
+                "2026-07-18T01:00:00Z",
+                None,
+                None,
+                "2026-07-19T00:00:00Z",
+            ),
+        )
+        connection.execute("ALTER TABLE items ADD COLUMN original_published_at TEXT")
+        connection.execute(
+            "UPDATE items SET original_published_at=? WHERE id=?",
+            ("2020-12-31T00:00:00Z", item_ids[0]),
+        )
+        connection.commit()
+
+        with tempfile.TemporaryDirectory() as directory:
+            site = Path(directory)
+            initial = item_page.export_item_pages(
+                connection, site, "https://reader.example/radar/"
+            )
+            self.assertEqual(initial["item_count"], 2)
+            public_ids = [item_page.public_item_id(key) for key in canonical_keys]
+            shards = [
+                site / "items" / public_id[:2] / f"{public_id}.json"
+                for public_id in public_ids
+            ]
+            self.assertTrue(all(path.is_file() for path in shards))
+
+            # A valid-looking obsolete shard belongs to this exporter and must
+            # be removed. Files outside the exact shard grammar are retained.
+            stale_public_id = "f" * 32
+            stale_shard = (
+                site / "items" / stale_public_id[:2] / f"{stale_public_id}.json"
+            )
+            stale_shard.parent.mkdir(parents=True, exist_ok=True)
+            stale_shard.write_text("{}\n", encoding="utf-8")
+            unrelated = stale_shard.parent / "notes.json"
+            unrelated.write_text("keep\n", encoding="utf-8")
+            unrelated_dir_file = site / "items" / "misc" / "data.json"
+            unrelated_dir_file.parent.mkdir(parents=True, exist_ok=True)
+            unrelated_dir_file.write_text("keep\n", encoding="utf-8")
+
+            filtered = item_page.export_item_pages(
+                connection,
+                site,
+                "https://reader.example/radar/",
+                item_ids=[item_ids[0], item_ids[0], 999_999],
+            )
+            self.assertEqual(filtered["item_count"], 1)
+            self.assertEqual(set(filtered["by_item_id"]), {item_ids[0]})
+            self.assertTrue(shards[0].is_file())
+            self.assertFalse(shards[1].exists())
+            self.assertFalse(stale_shard.exists())
+            self.assertTrue(unrelated.is_file())
+            self.assertTrue(unrelated_dir_file.is_file())
+
+            payload = json.loads(shards[0].read_text(encoding="utf-8"))
+            self.assertEqual(
+                payload["original_published_at"], "2020-12-31T00:00:00Z"
+            )
+            self.assertEqual(
+                [source["external_id"] for source in payload["sources"]],
+                ["paper-1"],
+            )
+            self.assertEqual(
+                [version["title"] for version in payload["versions"]], ["Version 1"]
+            )
+            self.assertEqual(
+                [event["event_id"] for event in payload["events"]],
+                [f"1:{item_ids[0]}:updated"],
+            )
+
+            empty = item_page.export_item_pages(
+                connection,
+                site,
+                "https://reader.example/radar/",
+                item_ids=[],
+            )
+            self.assertEqual(empty["item_count"], 0)
+            self.assertEqual(empty["by_item_id"], {})
+            self.assertFalse(shards[0].exists())
+            self.assertTrue(unrelated.is_file())
+            self.assertTrue(unrelated_dir_file.is_file())
+            self.assertTrue((site / "item.html").is_file())
         connection.close()
 
     def test_malformed_professional_brief_is_downgraded_to_strict_fallback(self):

@@ -454,6 +454,10 @@ class RadarUnitTests(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM items").fetchone()[0], 1)
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM item_sources").fetchone()[0], 2)
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM run_events WHERE event_type='new'").fetchone()[0], 1)
+        self.assertEqual(
+            conn.execute("SELECT original_published_at FROM items").fetchone()[0],
+            "2025-12-31T00:00:00Z",
+        )
 
     def test_different_dois_do_not_merge_same_title_and_year(self):
         conn = sqlite3.connect(":memory:")
@@ -504,6 +508,128 @@ class RadarUnitTests(unittest.TestCase):
         self.assertEqual(payload["backfill_percent"], 100.0)
         conn.execute("UPDATE run_events SET delivered_at='now' WHERE delivered_at IS NULL")
         self.assertEqual(radar.report_payload(conn, second_run, [])["new_count"], 0)
+
+    def test_retention_hides_old_history_without_losing_current_old_item_update(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(radar.SCHEMA)
+        conn.execute(
+            "INSERT INTO sources(id,name,kind,category,homepage,endpoint,config_json,initialized) "
+            "VALUES('a','A','rss','paper','https://example.com','https://example.com/feed','{}',1)"
+        )
+        run_id = conn.execute(
+            "INSERT INTO runs(started_at,status) VALUES('2026-07-20T00:00:00Z','ok')"
+        ).lastrowid
+
+        def add_item(key, published):
+            item_id = conn.execute(
+                """
+                INSERT INTO items(
+                    canonical_key,item_type,title,normalized_title,url,published_at,
+                    original_published_at,summary,topics_json,discovered_at,updated_at,baseline
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,1)
+                """,
+                (
+                    key,
+                    "paper",
+                    key,
+                    key,
+                    f"https://example.com/{key}",
+                    published,
+                    published,
+                    "NAND evidence.",
+                    "[]",
+                    "2026-07-20T00:00:00Z",
+                    "2026-07-20T00:00:00Z",
+                ),
+            ).lastrowid
+            conn.execute(
+                """
+                INSERT INTO item_sources(
+                    source_id,external_id,item_id,source_url,raw_hash,first_seen_at,last_seen_at
+                ) VALUES('a',?,?,?,'hash','now','now')
+                """,
+                (key, item_id, f"https://example.com/{key}"),
+            )
+            return item_id
+
+        old = add_item("old", "2019-01-01T00:00:00Z")
+        recent = add_item("recent", "2026-01-01T00:00:00Z")
+        stale = add_item("stale", "2026-01-01T00:00:00Z")
+        conn.executemany(
+            "INSERT INTO run_events(run_id,item_id,source_id,event_type,created_at) VALUES(?,?,'a',?,?)",
+            (
+                (run_id, old, "new", "2026-07-20T01:00:00Z"),
+                (run_id, old, "updated", "2026-07-20T02:00:00Z"),
+                (run_id, recent, "new", "2026-07-20T03:00:00Z"),
+                (run_id, stale, "updated", "2021-07-19T23:59:59Z"),
+            ),
+        )
+        conn.commit()
+        radar.briefs.ensure_fallback_briefs(conn)
+        mark_professional(conn)
+
+        self.assertEqual(radar.suppress_out_of_scope_events(conn, "2021-07-20"), 2)
+        self.assertEqual(
+            [row["canonical_key"] for row in radar.item_rows(conn, "2021-07-20")],
+            ["stale", "recent"],
+        )
+        self.assertEqual(
+            [row["canonical_key"] for row in radar.pending_event_rows(conn, "new", "2021-07-20")],
+            ["recent"],
+        )
+        self.assertEqual(
+            [row["canonical_key"] for row in radar.pending_event_rows(conn, "updated", "2021-07-20")],
+            ["old"],
+        )
+        payload = radar.report_payload(
+            conn, run_id, [], history_cutoff="2021-07-20", history_window_years=5
+        )
+        self.assertEqual((payload["new_count"], payload["updated_count"]), (1, 1))
+        self.assertEqual(payload["total_item_count"], 2)
+        self.assertEqual(payload["history_cutoff"], "2021-07-20")
+        conn.close()
+
+    def test_late_old_discovery_is_not_new_but_later_material_change_is_an_update(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(radar.SCHEMA)
+        conn.execute(
+            "INSERT INTO sources(id,name,kind,category,homepage,endpoint,config_json,initialized) "
+            "VALUES('a','A','rss','paper','https://example.com','https://example.com/feed','{}',1)"
+        )
+        run_id = conn.execute("INSERT INTO runs(started_at,status) VALUES('now','ok')").lastrowid
+        source = {"id": "a", "category": "paper"}
+        record = {
+            "external_id": "old",
+            "item_type": "paper",
+            "title": "Old NAND paper",
+            "url": "https://example.com/old",
+            "doi": "10.1/old",
+            "authors": "A",
+            "venue": "FAST",
+            "published_at": "2019-01-01",
+            "summary": "Original NAND evidence.",
+        }
+        self.assertEqual(
+            radar.ingest_record(
+                conn, run_id, source, dict(record), True, history_cutoff="2021-07-20"
+            ),
+            (False, False),
+        )
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM run_events").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT baseline FROM items").fetchone()[0], 1)
+
+        changed = dict(record, summary="Materially revised NAND evidence.")
+        self.assertEqual(
+            radar.ingest_record(
+                conn, run_id, source, changed, True, history_cutoff="2021-07-20"
+            ),
+            (False, True),
+        )
+        event = conn.execute("SELECT event_type FROM run_events").fetchone()
+        self.assertEqual(event["event_type"], "updated")
+        conn.close()
 
     def test_brief_generation_failure_is_reported_but_does_not_fail_source_health(self):
         conn = sqlite3.connect(":memory:")
@@ -597,7 +723,7 @@ class RadarUnitTests(unittest.TestCase):
         item_id = conn.execute("SELECT id FROM items").fetchone()[0]
         mark_professional(conn, item_id)
         rows = conn.execute(
-            "SELECT i.*,b.public_id,b.status AS brief_status,b.brief_json,"
+            "SELECT i.*,1 AS retention_eligible,b.public_id,b.status AS brief_status,b.brief_json,"
             "e.run_id,e.event_type,e.created_at AS event_created_at "
             "FROM run_events e JOIN items i ON i.id=e.item_id "
             "JOIN item_briefs b ON b.item_id=i.id WHERE e.event_type='updated'"

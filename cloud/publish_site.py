@@ -24,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 import briefs
 import item_page
+import retention
 
 
 ATOM = "http://www.w3.org/2005/Atom"
@@ -66,7 +67,14 @@ def add_discovery_links(channel: ET.Element, feed_url: str) -> None:
     ET.SubElement(channel, f"{{{ATOM}}}link", {"rel": "hub", "href": HUB_URL})
 
 
-def rewrite_live_feed(path: Path, base_url: str) -> None:
+def rewrite_live_feed(
+    path: Path,
+    base_url: str,
+    *,
+    history_window_years: int = retention.DEFAULT_HISTORY_WINDOW_YEARS,
+    history_cutoff: str,
+) -> None:
+    history_cutoff = validate_history_cutoff(history_cutoff)
     tree = ET.parse(path)
     root = tree.getroot()
     channel = root.find("channel")
@@ -78,7 +86,11 @@ def rewrite_live_feed(path: Path, base_url: str) -> None:
     link_node.text = base_url
     description = channel.find("description")
     if description is not None:
-        description.text = "SSD / NAND / NVMe 新增与实质更新（最近 350 个事件）"
+        description.text = (
+            f"SSD / NAND / NVMe 当前新增与实质更新；事件按发生时间保留滚动最近 "
+            f"{history_window_years} 年，旧资料今天发生的实质更新仍会发布，迟发现的"
+            f"窗口外旧资料不作为新增（最近 350 个事件；截止日 {history_cutoff}）"
+        )
     ttl = channel.find("ttl")
     if ttl is None:
         ttl = ET.SubElement(channel, "ttl")
@@ -141,18 +153,28 @@ def add_feed_item(
     add_text(item, "description", "\n".join(parts))
 
 
-def build_full_feed(database: Path, destination: Path, base_url: str) -> int:
+def build_full_feed(
+    database: Path,
+    destination: Path,
+    base_url: str,
+    *,
+    history_cutoff: str,
+    history_window_years: int = retention.DEFAULT_HISTORY_WINDOW_YEARS,
+) -> int:
+    validate_history_cutoff(history_cutoff)
     connection = sqlite3.connect(database)
     connection.row_factory = sqlite3.Row
     try:
         briefs.validate_professional_briefs(connection)
         baseline_rows = connection.execute(
-            """
+            f"""
             SELECT i.*,b.brief_json,b.status AS brief_status
             FROM items i JOIN item_briefs b ON b.item_id=i.id
             WHERE i.baseline=1 AND b.status='professional'
+              AND {retention.item_date_sql('i')}>=?
             ORDER BY COALESCE(published_at,discovered_at) DESC,id DESC
-            """
+            """,
+            (history_cutoff,),
         ).fetchall()
         event_rows = connection.execute(
             """
@@ -160,9 +182,22 @@ def build_full_feed(database: Path, destination: Path, base_url: str) -> int:
                    e.run_id,e.event_type,e.created_at AS event_created_at
             FROM run_events e JOIN items i ON i.id=e.item_id
             JOIN item_briefs b ON b.item_id=i.id AND b.status='professional'
+            WHERE e.suppressed_at IS NULL
+              AND SUBSTR(e.created_at,1,10)>=?
             ORDER BY e.created_at DESC,e.run_id DESC,i.id DESC
-            """
+            """,
+            (history_cutoff,),
         ).fetchall()
+        event_rows = [
+            row
+            for row in event_rows
+            if retention.event_is_in_scope(
+                row["event_type"],
+                row["original_published_at"],
+                row["event_created_at"],
+                history_cutoff,
+            )
+        ]
     finally:
         connection.close()
 
@@ -173,7 +208,9 @@ def build_full_feed(database: Path, destination: Path, base_url: str) -> int:
     add_text(
         channel,
         "description",
-        "只发布已经完成中文专业整理并通过证据校验的历史、新增资料和实质更新；待整理历史会在合格后自动出现。",
+        f"历史快照只发布首发日在滚动最近 {history_window_years} 年内、已经完成中文专业整理"
+        f"并通过证据校验的资料；当前事件按发生时间收录，旧资料今天发生的实质更新仍可发布，"
+        f"迟发现的窗口外旧资料不作为新增；截止日 {history_cutoff}。",
     )
     add_text(channel, "language", "zh-CN")
     add_text(channel, "lastBuildDate", email.utils.format_datetime(dt.datetime.now(UTC)))
@@ -206,11 +243,17 @@ def build_full_feed(database: Path, destination: Path, base_url: str) -> int:
     return len(baseline_rows) + len(event_rows)
 
 
-def build_opml(destination: Path, base_url: str, generated_opml: Optional[Path] = None) -> None:
+def build_opml(
+    destination: Path,
+    base_url: str,
+    generated_opml: Optional[Path] = None,
+    *,
+    history_window_years: int = retention.DEFAULT_HISTORY_WINDOW_YEARS,
+) -> None:
     # radar.py already emits the preferred NetNewsWire layout: one live feed
     # plus pre-created stable hash buckets. Keep subscriptions.opml as a
-    # compatibility alias instead of collapsing the history into a single
-    # 2,900+ item feed that server readers may truncate.
+    # compatibility alias instead of collapsing the rolling history into one
+    # large feed that server readers may truncate.
     if generated_opml and generated_opml.is_file():
         shutil.copyfile(generated_opml, destination)
         return
@@ -222,8 +265,8 @@ def build_opml(destination: Path, base_url: str, generated_opml: Optional[Path] 
         body,
         "outline",
         {
-            "text": "SSD Research Radar｜专业简报历史与后续更新",
-            "title": "SSD Research Radar｜专业简报历史与后续更新",
+            "text": f"SSD Research Radar｜滚动 {history_window_years} 年专业简报与后续更新",
+            "title": f"SSD Research Radar｜滚动 {history_window_years} 年专业简报与后续更新",
             "type": "rss",
             "xmlUrl": urllib.parse.urljoin(base_url, "full.xml"),
             "htmlUrl": base_url,
@@ -233,10 +276,45 @@ def build_opml(destination: Path, base_url: str, generated_opml: Optional[Path] 
     ET.ElementTree(root).write(destination, encoding="utf-8", xml_declaration=True)
 
 
-def build_status(report_path: Path, destination: Path) -> None:
+def load_report(report_path: Path) -> Dict[str, Any]:
     if not report_path.is_file():
-        return
+        raise FileNotFoundError(report_path)
     report = json.loads(report_path.read_text(encoding="utf-8"))
+    if not isinstance(report, dict):
+        raise ValueError("latest report must be a JSON object")
+    return report
+
+
+def validate_history_cutoff(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("latest report is missing history_cutoff")
+    cutoff = value.strip()
+    try:
+        parsed = dt.date.fromisoformat(cutoff)
+    except ValueError as exc:
+        raise ValueError("latest report history_cutoff must be an ISO date") from exc
+    if parsed.isoformat() != cutoff:
+        raise ValueError("latest report history_cutoff must be an ISO date")
+    return cutoff
+
+
+def report_history_policy(report: Dict[str, Any]) -> tuple[str, int]:
+    cutoff = validate_history_cutoff(report.get("history_cutoff"))
+    try:
+        window_years = retention.history_window_years(report)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("latest report has invalid history_window_years") from exc
+    return cutoff, window_years
+
+
+def build_status(
+    report_path: Path,
+    destination: Path,
+    *,
+    report: Optional[Dict[str, Any]] = None,
+) -> None:
+    report = report if report is not None else load_report(report_path)
+    history_cutoff, history_window_years = report_history_policy(report)
     public = {
         "ok": bool(report.get("ok")),
         "source_failure_count": int(report.get("source_failure_count", 0)),
@@ -245,6 +323,8 @@ def build_status(report_path: Path, destination: Path) -> None:
             report.get("brief_generation_failure_count", 0)
         ),
         "checked_at": report.get("checked_at"),
+        "history_window_years": history_window_years,
+        "history_cutoff": history_cutoff,
         "new_count": int(report.get("new_count", 0)),
         "updated_count": int(report.get("updated_count", 0)),
         "awaiting_brief_count": int(report.get("awaiting_brief_count", 0)),
@@ -302,18 +382,32 @@ def main(argv: Sequence[str] | None = None) -> int:
     base_url = normalized_base_url(args.base_url)
     if not args.database.is_file():
         raise FileNotFoundError(args.database)
+    report = load_report(args.report)
+    history_cutoff, history_window_years = report_history_policy(report)
     args.site.mkdir(parents=True, exist_ok=True)
-    rewrite_live_feed(args.site / "live.xml", base_url)
+    rewrite_live_feed(
+        args.site / "live.xml",
+        base_url,
+        history_window_years=history_window_years,
+        history_cutoff=history_cutoff,
+    )
     # Keep the long-standing feed.xml subscription as a byte-for-byte alias;
     # the canonical WebSub topic remains live.xml.
     shutil.copyfile(args.site / "live.xml", args.site / "feed.xml")
-    count = build_full_feed(args.database, args.site / "full.xml", base_url)
+    count = build_full_feed(
+        args.database,
+        args.site / "full.xml",
+        base_url,
+        history_cutoff=history_cutoff,
+        history_window_years=history_window_years,
+    )
     build_opml(
         args.site / "subscriptions.opml",
         base_url,
         generated_opml=args.site / "netnewswire.opml",
+        history_window_years=history_window_years,
     )
-    build_status(args.report, args.site / "status.json")
+    build_status(args.report, args.site / "status.json", report=report)
     inject_subscription_links(args.site / "index.html", base_url)
     (args.site / ".nojekyll").touch()
     print(f"Prepared public site with {count} full-feed entries: {base_url}")
