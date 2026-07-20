@@ -43,6 +43,8 @@ jobs:
       GROUPS_IO_API_KEY: ${{ secrets.GROUPS_IO_API_KEY }}
     outputs:
       sync_exit: ${{ steps.sync.outputs.exit_code }}
+      source_failure_count: ${{ steps.sync.outputs.source_failure_count }}
+      brief_failure_count: ${{ steps.sync.outputs.brief_failure_count }}
       state_changed: ${{ steps.compare.outputs.changed }}
     steps:
       - name: Check out source
@@ -151,12 +153,28 @@ jobs:
           set -e
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           cat sync-output.json
+          counts=$(python3 - <<'PY'
+          import json
+
+          report = json.load(open("sync-output.json", encoding="utf-8"))
+          print(
+              int(report["source_failure_count"]),
+              int(report["brief_generation_failure_count"]),
+          )
+          PY
+          )
+          read -r source_failures brief_failures <<< "$counts"
+          echo "source_failure_count=$source_failures" >> "$GITHUB_OUTPUT"
+          echo "brief_failure_count=$brief_failures" >> "$GITHUB_OUTPUT"
           if [[ "$code" -ne 0 && "$code" -ne 2 ]]; then
             echo "::error::radar.py failed before producing a usable partial result (exit $code)"
             exit "$code"
           fi
           if [[ "$code" -eq 2 ]]; then
-            echo "::warning::One or more sources failed; the partial health state will still be published."
+            echo "::warning::$source_failures research source(s) failed; the partial health state will still be published."
+          fi
+          if [[ "$brief_failures" -gt 0 ]]; then
+            echo "::warning::Professional brief validation rejected one or more items. They remain withheld and will retry automatically; this is not a deployment failure."
           fi
 
       - name: Compare durable material state
@@ -241,25 +259,34 @@ jobs:
             "${PUBLIC_BASE_URL}feed.xml" \
             "${PUBLIC_BASE_URL}live.xml"
 
-  report-partial-failure:
+  report-health:
     needs: [sync-and-build, deploy]
     if: always()
     permissions:
       contents: read
     runs-on: ubuntu-latest
     steps:
-      - name: Preserve partial-sync failure signal after publishing
+      - name: Report source and deployment health
         env:
           SYNC_RESULT: ${{ needs.sync-and-build.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
           SYNC_EXIT: ${{ needs.sync-and-build.outputs.sync_exit }}
+          SOURCE_FAILURE_COUNT: ${{ needs.sync-and-build.outputs.source_failure_count }}
+          BRIEF_FAILURE_COUNT: ${{ needs.sync-and-build.outputs.brief_failure_count }}
         run: |
           if [[ "$SYNC_RESULT" != "success" || "$DEPLOY_RESULT" != "success" ]]; then
             echo "Build or deployment failed."
             exit 1
           fi
-          if [[ "$SYNC_EXIT" == "2" ]]; then
-            echo "The partial result and source health were published, but at least one source failed."
+          if [[ "$SYNC_EXIT" != "0" && "$SYNC_EXIT" != "2" ]]; then
+            echo "Sync finished with an invalid or missing health exit code: ${SYNC_EXIT:-missing}."
             exit 1
           fi
-          echo "All sources synchronized and the public site was deployed."
+          if [[ "$SYNC_EXIT" == "2" || "${SOURCE_FAILURE_COUNT:-0}" -gt 0 ]]; then
+            echo "The partial result was published, but $SOURCE_FAILURE_COUNT research source(s) failed."
+            exit 1
+          fi
+          if [[ "${BRIEF_FAILURE_COUNT:-0}" -gt 0 ]]; then
+            echo "::warning::Professional brief retries remain withheld; source synchronization and deployment succeeded."
+          fi
+          echo "All research sources synchronized and the public site was deployed."

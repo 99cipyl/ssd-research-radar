@@ -505,6 +505,71 @@ class RadarUnitTests(unittest.TestCase):
         conn.execute("UPDATE run_events SET delivered_at='now' WHERE delivered_at IS NULL")
         self.assertEqual(radar.report_payload(conn, second_run, [])["new_count"], 0)
 
+    def test_brief_generation_failure_is_reported_but_does_not_fail_source_health(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(radar.SCHEMA)
+        radar.briefs.ensure_schema(conn)
+        run_id = conn.execute(
+            "INSERT INTO runs(started_at,status) VALUES('now','ok')"
+        ).lastrowid
+        payload = radar.report_payload(
+            conn,
+            run_id,
+            [],
+            brief_failures=[
+                {
+                    "id": radar.BRIEF_GENERATION_FAILURE_ID,
+                    "name": "专业简报生成",
+                    "ok": False,
+                    "failed_count": 2,
+                    "error": "证据校验失败；下次自动重试",
+                }
+            ],
+        )
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["source_failure_count"], 0)
+        self.assertFalse(payload["brief_generation_ok"])
+        self.assertEqual(payload["brief_generation_failure_count"], 2)
+        self.assertEqual(len(payload["failures"]), 1)
+        conn.close()
+
+    def test_real_source_failure_still_fails_source_health(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(radar.SCHEMA)
+        radar.briefs.ensure_schema(conn)
+        run_id = conn.execute(
+            "INSERT INTO runs(started_at,status) VALUES('now','partial')"
+        ).lastrowid
+        payload = radar.report_payload(
+            conn,
+            run_id,
+            [
+                {
+                    "id": "openalex_ssd",
+                    "name": "OpenAlex",
+                    "ok": False,
+                    "error": "HTTP 503",
+                }
+            ],
+            brief_failures=[
+                {
+                    "id": radar.BRIEF_GENERATION_FAILURE_ID,
+                    "name": "专业简报生成",
+                    "ok": False,
+                    "failed_count": 3,
+                    "error": "模型限流；下次自动重试",
+                },
+            ],
+        )
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["source_failure_count"], 1)
+        self.assertFalse(payload["brief_generation_ok"])
+        self.assertEqual(payload["brief_generation_failure_count"], 3)
+        self.assertEqual(len(payload["failures"]), 2)
+        conn.close()
+
     def test_material_update_is_versioned_and_enters_rss(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row

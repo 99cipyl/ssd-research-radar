@@ -52,6 +52,7 @@ MAX_FEED_ITEMS = 350
 ARCHIVE_BUCKET_COUNT = 32
 LOCAL_BASE_URL = "http://127.0.0.1:8765/"
 UTC = dt.timezone.utc
+BRIEF_GENERATION_FAILURE_ID = "brief_generation"
 
 
 SCHEMA = """
@@ -1987,13 +1988,20 @@ def report_payload(
     run_id: int,
     source_results: List[Dict[str, Any]],
     warnings: Optional[List[str]] = None,
+    brief_failures: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     # Read from the persistent outbox, not only this run.  If a prior process
     # exited after ingesting records but before writing latest.json, those
     # events are retried here instead of being silently lost.
     new_rows = pending_event_rows(conn, "new")
     updated_rows = pending_event_rows(conn, "updated")
-    failures = [result for result in source_results if not result.get("ok")]
+    source_failures = [result for result in source_results if not result.get("ok")]
+    brief_generation_failures = list(brief_failures or [])
+    failures = [*source_failures, *brief_generation_failures]
+    brief_generation_failure_count = sum(
+        max(1, int(failure.get("failed_count", 1) or 1))
+        for failure in brief_generation_failures
+    )
 
     def prepared_item(row: sqlite3.Row, event_type: str) -> Dict[str, Any]:
         brief = row_brief(row)
@@ -2041,7 +2049,14 @@ def report_payload(
         combined_warnings.append(f"{awaiting_briefs} 条新增/更新正在等待专业简报，生成成功前不会推送")
     return {
         "run_id": run_id,
-        "ok": not failures,
+        # Professional-brief rejection is deliberately fail-closed: the item
+        # stays out of every feed and is retried.  It is an important health
+        # signal, but it is not a source-ingestion or deployment failure and
+        # therefore must not make an otherwise healthy Actions run fail.
+        "ok": not source_failures,
+        "source_failure_count": len(source_failures),
+        "brief_generation_ok": not brief_generation_failures,
+        "brief_generation_failure_count": brief_generation_failure_count,
         "initialized": [r["name"] for r in source_results if r.get("baseline") and r.get("ok")],
         "new_count": len(new_rows),
         "updated_count": len(updated_rows),
@@ -2064,7 +2079,10 @@ def report_payload(
 def markdown_report(payload: Dict[str, Any], max_items: int = 30) -> str:
     lines = [
         f"NEW_COUNT={payload['new_count']} UPDATED_COUNT={payload['updated_count']} "
-        f"FAILURES={len(payload['failures'])} WARNINGS={len(payload.get('warnings', []))}",
+        f"FAILURES={len(payload['failures'])} "
+        f"SOURCE_FAILURES={payload.get('source_failure_count', len(payload['failures']))} "
+        f"BRIEF_FAILURES={payload.get('brief_generation_failure_count', 0)} "
+        f"WARNINGS={len(payload.get('warnings', []))}",
         f"ARCHIVE={payload['archive_path']}",
     ]
     if payload["initialized"]:
@@ -2175,6 +2193,7 @@ def run_sync(force_full: bool = False, report_format: str = "markdown", max_repo
             )
         ]
         brief_warnings: List[str] = []
+        brief_failures: List[Dict[str, Any]] = []
         if requeued_events:
             brief_warnings.append(
                 f"{requeued_events} 条旧事件已重新进入专业简报门禁；整理完成前不会发布"
@@ -2212,19 +2231,15 @@ def run_sync(force_full: bool = False, report_format: str = "markdown", max_repo
                     f"专业简报生成失败 {brief_result['failed']} 条，已保留待下次自动重试："
                     + brief_error
                 )
-                source_results.append(
+                brief_failures.append(
                     {
-                        "id": "brief_generation",
+                        "id": BRIEF_GENERATION_FAILURE_ID,
                         "name": "专业简报生成",
                         "ok": False,
+                        "failed_count": int(brief_result["failed"]),
                         "error": f"{brief_result['failed']} 条失败：{brief_error}"[:1000],
                     }
                 )
-                conn.execute(
-                    "UPDATE runs SET status='partial',failed_sources=failed_sources+1 WHERE id=?",
-                    (run_id,),
-                )
-                conn.commit()
             if brief_result.get("deferred"):
                 brief_warnings.append(
                     f"专业简报达到本轮时间预算，另有 {brief_result['deferred']} 条留待后续批次"
@@ -2239,7 +2254,13 @@ def run_sync(force_full: bool = False, report_format: str = "markdown", max_repo
             brief_warnings.append(f"发现 {demoted} 条旧专业简报结构失效，已停止发布并重新排队")
         build_site(conn)
         websub_warnings = publish_pending_websub(conn)
-        payload = report_payload(conn, run_id, source_results, [*brief_warnings, *websub_warnings])
+        payload = report_payload(
+            conn,
+            run_id,
+            source_results,
+            warnings=[*brief_warnings, *websub_warnings],
+            brief_failures=brief_failures,
+        )
         report_text = markdown_report(payload, max_report_items)
         REPORTS_DIR.mkdir(parents=True, exist_ok=True)
         stamp = utcnow().strftime("%Y-%m-%dT%H%M%SZ")

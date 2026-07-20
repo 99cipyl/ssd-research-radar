@@ -223,6 +223,39 @@ class CloudPublishingTests(unittest.TestCase):
             fingerprint = state_db.material_fingerprint(database)
             self.assertRegex(fingerprint, r"^[a-f0-9]{64}$")
 
+    def test_public_status_separates_source_health_from_brief_retries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = root / "latest.json"
+            destination = root / "status.json"
+            report.write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "source_failure_count": 0,
+                        "brief_generation_ok": False,
+                        "brief_generation_failure_count": 13,
+                        "failures": [
+                            {
+                                "id": "brief_generation",
+                                "name": "专业简报生成",
+                                "failed_count": 13,
+                                "error": "证据校验失败；下次自动重试",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            publish_site.build_status(report, destination)
+            status = json.loads(destination.read_text(encoding="utf-8"))
+            self.assertTrue(status["ok"])
+            self.assertEqual(status["source_failure_count"], 0)
+            self.assertFalse(status["brief_generation_ok"])
+            self.assertEqual(status["brief_generation_failure_count"], 13)
+            self.assertEqual(status["failures"][0]["failed_count"], 13)
+
 
 if __name__ == "__main__":
     unittest.main()

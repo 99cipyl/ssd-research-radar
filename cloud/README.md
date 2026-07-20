@@ -63,6 +63,13 @@ the workflow run failed, preserving the operational warning. If the same run
 also discovered content, that content and its already-delivered event are
 persisted before deployment, so the event is not silently discarded.
 
+A professional-brief model or evidence-validation failure is a different,
+recoverable state. The affected item remains withheld from every feed and is
+listed under `failures` for retry/heartbeat visibility, while `source_failure_count`
+stays zero, `brief_generation_ok` becomes false, and the sync command exits 0.
+GitHub Actions therefore shows a warning without sending a false deployment-
+failure email. A real source, test, state, or Pages failure still makes the run red.
+
 ## Optional secrets
 
 The non-OpenAlex sources retain documented public fallbacks without

@@ -1,5 +1,7 @@
 import json
+import os
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -156,6 +158,86 @@ class PrepareSyncTests(unittest.TestCase):
             "              ;;", 1
         )[0]
         self.assertIn("export RADAR_BRIEF_HISTORY_LIMIT=0", monthly_case)
+
+    def test_workflow_treats_brief_retry_as_warning_not_failed_deployment(self):
+        workflow = (ROOT / ".github/workflows/publish-radar.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("brief_generation_failure_count", workflow)
+        self.assertIn("Professional brief retries remain withheld", workflow)
+        self.assertIn("report-health:", workflow)
+        self.assertNotIn("report-partial-failure:", workflow)
+
+    def test_report_health_shell_status_matrix(self):
+        workflow = (ROOT / ".github/workflows/publish-radar.yml").read_text(
+            encoding="utf-8"
+        )
+        section = workflow.split(
+            "      - name: Report source and deployment health\n", 1
+        )[1]
+        raw_script = section.split("        run: |\n", 1)[1]
+        lines = []
+        for line in raw_script.splitlines():
+            if line and not line.startswith("          "):
+                break
+            lines.append(line[10:] if line.startswith("          ") else "")
+        script = "\n".join(lines) + "\n"
+
+        def run(**values):
+            return subprocess.run(
+                ["bash", "-e"],
+                input=script,
+                text=True,
+                capture_output=True,
+                env={**os.environ, **values},
+                check=False,
+            )
+
+        brief_only = run(
+            SYNC_RESULT="success",
+            DEPLOY_RESULT="success",
+            SYNC_EXIT="0",
+            SOURCE_FAILURE_COUNT="0",
+            BRIEF_FAILURE_COUNT="13",
+        )
+        self.assertEqual(brief_only.returncode, 0, brief_only.stderr)
+        self.assertIn("Professional brief retries remain withheld", brief_only.stdout)
+
+        source_failure = run(
+            SYNC_RESULT="success",
+            DEPLOY_RESULT="success",
+            SYNC_EXIT="2",
+            SOURCE_FAILURE_COUNT="1",
+            BRIEF_FAILURE_COUNT="0",
+        )
+        self.assertNotEqual(source_failure.returncode, 0)
+
+        inconsistent_source_health = run(
+            SYNC_RESULT="success",
+            DEPLOY_RESULT="success",
+            SYNC_EXIT="0",
+            SOURCE_FAILURE_COUNT="1",
+            BRIEF_FAILURE_COUNT="0",
+        )
+        self.assertNotEqual(inconsistent_source_health.returncode, 0)
+
+        missing_exit = run(
+            SYNC_RESULT="success",
+            DEPLOY_RESULT="success",
+            SYNC_EXIT="",
+            SOURCE_FAILURE_COUNT="0",
+            BRIEF_FAILURE_COUNT="0",
+        )
+        self.assertNotEqual(missing_exit.returncode, 0)
+
+        deployment_failure = run(
+            SYNC_RESULT="success",
+            DEPLOY_RESULT="failure",
+            SYNC_EXIT="0",
+            SOURCE_FAILURE_COUNT="0",
+            BRIEF_FAILURE_COUNT="0",
+        )
+        self.assertNotEqual(deployment_failure.returncode, 0)
 
 
 if __name__ == "__main__":

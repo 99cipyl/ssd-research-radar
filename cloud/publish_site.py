@@ -239,6 +239,11 @@ def build_status(report_path: Path, destination: Path) -> None:
     report = json.loads(report_path.read_text(encoding="utf-8"))
     public = {
         "ok": bool(report.get("ok")),
+        "source_failure_count": int(report.get("source_failure_count", 0)),
+        "brief_generation_ok": bool(report.get("brief_generation_ok", True)),
+        "brief_generation_failure_count": int(
+            report.get("brief_generation_failure_count", 0)
+        ),
         "checked_at": report.get("checked_at"),
         "new_count": int(report.get("new_count", 0)),
         "updated_count": int(report.get("updated_count", 0)),
@@ -254,7 +259,7 @@ def build_status(report_path: Path, destination: Path) -> None:
         "failures": [
             {
                 key: failure.get(key)
-                for key in ("id", "name", "error")
+                for key in ("id", "name", "failed_count", "error")
                 if failure.get(key) is not None
             }
             for failure in report.get("failures", [])
