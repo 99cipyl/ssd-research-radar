@@ -51,9 +51,10 @@ first day of each month, the explicit `--full` job enables only FAST and replays
 its bounded TOC set. OpenAlex performs an initial historical baseline and then
 uses a rolling one-year daily search; its 25-year keyword history is not replayed
 monthly because a late free-quota 429 would discard the whole fetched batch. A
-manual run or a relevant `main`-branch source/configuration push checks every
-source while likewise suppressing an automatic OpenAlex full replay. A single
-concurrency group prevents overlapping syncs.
+manual run or a relevant `main`-branch source/configuration push bypasses normal
+minimum polling intervals and checks every source, while still suppressing an
+automatic OpenAlex full replay. A single concurrency group prevents overlapping
+syncs.
 
 Every OpenAlex page uses 50 results and a bounded same-run retry loop covering
 transport errors, short bodies, malformed JSON, and valid JSON with an invalid

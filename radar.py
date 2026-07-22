@@ -1705,8 +1705,12 @@ def sync_source(conn: sqlite3.Connection, run_id: int, source: Dict[str, Any], f
             periodic_full = utcnow() - parsed_full >= dt.timedelta(days=30)
     full = force_full or not initialized or periodic_full
     minimum_interval = int(source.get("minimum_interval_hours", 0))
+    bypass_minimum_interval = os.environ.get(
+        "RADAR_BYPASS_MINIMUM_INTERVAL", ""
+    ).strip().casefold() in {"1", "true", "yes", "on"}
     if (
         not full
+        and not bypass_minimum_interval
         and minimum_interval
         and row["last_success_at"]
         and not row["last_error"]

@@ -159,6 +159,15 @@ class PrepareSyncTests(unittest.TestCase):
         )[0]
         self.assertIn("export RADAR_BRIEF_HISTORY_LIMIT=0", monthly_case)
 
+    def test_manual_repair_workflow_bypasses_source_poll_intervals(self):
+        workflow = (ROOT / ".github/workflows/publish-radar.yml").read_text(
+            encoding="utf-8"
+        )
+        manual_case = workflow.split("            manual)", 1)[1].split(
+            "              ;;", 1
+        )[0]
+        self.assertIn("export RADAR_BYPASS_MINIMUM_INTERVAL=1", manual_case)
+
     def test_workflow_limits_recent_history_backfill_and_tracks_retention_module(self):
         workflow = (ROOT / ".github/workflows/publish-radar.yml").read_text(
             encoding="utf-8"

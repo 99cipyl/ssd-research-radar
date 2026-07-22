@@ -129,6 +129,11 @@ jobs:
           case "$RADAR_SYNC_MODE" in
             manual)
               export RADAR_BRIEF_HISTORY_LIMIT=12
+              # A manual dispatch or relevant source-code push is a repair
+              # run: actually poll every enabled source even when its normal
+              # minimum interval has not elapsed. This remains incremental;
+              # it does not trigger a historical OpenAlex replay.
+              export RADAR_BYPASS_MINIMUM_INTERVAL=1
               # A source-code push is also the controlled repair path. Retry
               # validation failures immediately after prompt/validator fixes;
               # scheduled runs retain the normal six-hour backoff.

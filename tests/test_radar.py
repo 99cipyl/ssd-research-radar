@@ -648,6 +648,40 @@ class RadarUnitTests(unittest.TestCase):
         self.assertEqual(state["failure_count"], 0)
         conn.close()
 
+    def test_manual_repair_run_bypasses_a_fresh_minimum_interval(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(radar.SCHEMA)
+        source = {
+            "id": "academic_source",
+            "name": "Academic source",
+            "kind": "rss",
+            "category": "paper",
+            "homepage": "https://example.com/",
+            "endpoint": "https://example.com/feed.xml",
+            "minimum_interval_hours": 24,
+            "enabled": True,
+        }
+        radar.register_sources(conn, {"sources": [source]})
+        recent = radar.iso(radar.utcnow() - radar.dt.timedelta(minutes=5))
+        conn.execute(
+            "UPDATE sources SET initialized=1,last_success_at=? WHERE id=?",
+            (recent, source["id"]),
+        )
+        run_id = conn.execute(
+            "INSERT INTO runs(started_at,status) VALUES('now','running')"
+        ).lastrowid
+        fetcher = mock.Mock(return_value=[])
+
+        with mock.patch.dict(
+            os.environ, {"RADAR_BYPASS_MINIMUM_INTERVAL": "1"}
+        ), mock.patch.dict(radar.FETCHERS, {"rss": fetcher}):
+            result = radar.sync_source(conn, run_id, source, False)
+
+        fetcher.assert_called_once()
+        self.assertNotIn("skipped", result)
+        conn.close()
+
     def test_fetch_configuration_can_rebaseline_a_source_without_notification_flood(self):
         conn = sqlite3.connect(":memory:")
         conn.row_factory = sqlite3.Row
