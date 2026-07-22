@@ -352,17 +352,28 @@ def build_status(
     history_cutoff, history_window_years = report_history_policy(report)
     public = {
         "ok": bool(report.get("ok")),
+        "source_evaluated_count": int(report.get("source_evaluated_count", 0)),
+        "source_attempted_count": int(report.get("source_attempted_count", 0)),
+        "source_success_count": int(report.get("source_success_count", 0)),
+        "source_skipped_count": int(report.get("source_skipped_count", 0)),
         "source_failure_count": int(report.get("source_failure_count", 0)),
+        "source_checks": report.get("source_checks", []),
+        "source_failures": report.get("source_failures", []),
         "brief_generation_ok": bool(report.get("brief_generation_ok", True)),
         "brief_generation_failure_count": int(
             report.get("brief_generation_failure_count", 0)
         ),
+        "brief_failures": report.get("brief_failures", []),
         "checked_at": report.get("checked_at"),
         "history_window_years": history_window_years,
         "history_cutoff": history_cutoff,
         "history_reference_date": report.get("history_reference_date"),
         "new_count": int(report.get("new_count", 0)),
         "updated_count": int(report.get("updated_count", 0)),
+        "run_detected_new_count": int(report.get("run_detected_new_count", 0)),
+        "run_detected_updated_count": int(
+            report.get("run_detected_updated_count", 0)
+        ),
         "awaiting_brief_count": int(report.get("awaiting_brief_count", 0)),
         "total_item_count": int(report.get("total_item_count", 0)),
         "professional_brief_count": int(report.get("professional_brief_count", 0)),

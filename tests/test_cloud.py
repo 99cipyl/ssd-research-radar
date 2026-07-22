@@ -425,9 +425,29 @@ class CloudPublishingTests(unittest.TestCase):
                 json.dumps(
                     {
                         "ok": True,
+                        "source_evaluated_count": 3,
+                        "source_attempted_count": 2,
+                        "source_success_count": 2,
+                        "source_skipped_count": 1,
                         "source_failure_count": 0,
+                        "source_checks": [
+                            {"id": "fast", "name": "FAST", "status": "success"},
+                            {"id": "nvmw", "name": "NVMW", "status": "success"},
+                            {"id": "openalex", "name": "OpenAlex", "status": "fresh_cached"},
+                        ],
+                        "source_failures": [],
                         "brief_generation_ok": False,
                         "brief_generation_failure_count": 13,
+                        "brief_failures": [
+                            {
+                                "id": "brief_generation",
+                                "name": "专业简报生成",
+                                "failed_count": 13,
+                                "error": "证据校验失败；下次自动重试",
+                            }
+                        ],
+                        "run_detected_new_count": 4,
+                        "run_detected_updated_count": 2,
                         "history_window_years": 5,
                         "history_cutoff": self.HISTORY_CUTOFF,
                         "history_reference_date": self.HISTORY_CHECKED_AT.date().isoformat(),
@@ -449,9 +469,18 @@ class CloudPublishingTests(unittest.TestCase):
             publish_site.build_status(report, destination)
             status = json.loads(destination.read_text(encoding="utf-8"))
             self.assertTrue(status["ok"])
+            self.assertEqual(status["source_evaluated_count"], 3)
+            self.assertEqual(status["source_attempted_count"], 2)
+            self.assertEqual(status["source_success_count"], 2)
+            self.assertEqual(status["source_skipped_count"], 1)
             self.assertEqual(status["source_failure_count"], 0)
+            self.assertEqual(len(status["source_checks"]), 3)
+            self.assertEqual(status["source_failures"], [])
             self.assertFalse(status["brief_generation_ok"])
             self.assertEqual(status["brief_generation_failure_count"], 13)
+            self.assertEqual(len(status["brief_failures"]), 1)
+            self.assertEqual(status["run_detected_new_count"], 4)
+            self.assertEqual(status["run_detected_updated_count"], 2)
             self.assertEqual(status["history_window_years"], 5)
             self.assertEqual(status["history_cutoff"], self.HISTORY_CUTOFF)
             self.assertEqual(

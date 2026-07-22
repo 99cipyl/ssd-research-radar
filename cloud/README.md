@@ -55,6 +55,17 @@ manual run or a relevant `main`-branch source/configuration push checks every
 source while likewise suppressing an automatic OpenAlex full replay. A single
 concurrency group prevents overlapping syncs.
 
+Every OpenAlex page uses 50 results and a bounded same-run retry loop covering
+transport errors, short bodies, malformed JSON, and valid JSON with an invalid
+response shape. Stable work IDs, cursor continuity, cross-page duplicates,
+`meta.count`, and the page bound are checked as well. The first page rejects a
+query that deterministically exceeds the safety bound without wasting a full
+scan or retry. A cross-page invariant failure restarts that query once from its
+first cursor. If it is still incomplete,
+the whole OpenAlex snapshot fails closed and no partial batch is ingested. A
+source with a recorded failure is retried even inside its normal minimum interval;
+only a real upstream success clears the failure state.
+
 The durable database is stored in the orphan `radar-state` branch. Runtime-only
 changes such as `last_attempt_at`, `last_success_at`, empty `runs`, and delivery
 acknowledgements do not affect the material fingerprint. Consequently, an empty
@@ -74,10 +85,21 @@ persisted before deployment, so the event is not silently discarded.
 
 A professional-brief model or evidence-validation failure is a different,
 recoverable state. The affected item remains withheld from every feed and is
-listed under `failures` for retry/heartbeat visibility, while `source_failure_count`
-stays zero, `brief_generation_ok` becomes false, and the sync command exits 0.
+listed under `brief_failures` (and the compatibility `failures` aggregate) for
+retry/heartbeat visibility, while `source_failure_count` stays zero,
+`brief_generation_ok` becomes false, and the sync command exits 0.
 GitHub Actions therefore shows a warning without sending a false deployment-
 failure email. A real source, test, state, or Pages failure still makes the run red.
+
+`new_count` and `updated_count` count persistent outbox events that have already
+passed the professional gate; they are not claims that every source was checked.
+`run_detected_new_count` and `run_detected_updated_count` describe relevant,
+history-in-scope notification candidates from sources that actually succeeded in
+the current run, before the professional gate; they do not count every raw database
+mutation. `source_checks`, the source
+attempt/success/skip counters, and the separate `source_failures` list let clients
+say that a failed source has an unknown update state instead of falsely reporting
+"no updates".
 
 ## Optional secrets
 

@@ -83,6 +83,443 @@ class RadarUnitTests(unittest.TestCase):
         inverted = {"NAND": [0], "flash": [1], "retention": [3], "and": [2]}
         self.assertEqual(radar.reconstruct_abstract(inverted), "NAND flash and retention")
 
+    def test_request_json_retries_a_truncated_body_in_the_same_run(self):
+        truncated = b'{"results":[{"title":"cut'
+        complete = b'{"results":[],"meta":{"next_cursor":null}}'
+        with mock.patch.object(
+            radar,
+            "_request_once",
+            side_effect=[(truncated, {"X-Attempt": "1"}), (complete, {"X-Attempt": "2"})],
+        ) as request, mock.patch.object(radar.time, "sleep") as sleep:
+            payload, headers = radar.request_json(
+                "https://api.example/works", retries=3
+            )
+
+        self.assertEqual(payload, {"results": [], "meta": {"next_cursor": None}})
+        self.assertEqual(headers["X-Attempt"], "2")
+        self.assertEqual(request.call_count, 2)
+        first_headers = request.call_args_list[0].args[1]
+        second_headers = request.call_args_list[1].args[1]
+        self.assertNotIn("Cache-Control", first_headers)
+        self.assertEqual(second_headers["Cache-Control"], "no-cache")
+        sleep.assert_called_once_with(1)
+
+    def test_request_json_reports_exhausted_integrity_retries(self):
+        truncated = b'{"results":[{"title":"cut'
+        with mock.patch.object(
+            radar,
+            "_request_once",
+            return_value=(truncated, {}),
+        ) as request, mock.patch.object(radar.time, "sleep") as sleep:
+            with self.assertRaisesRegex(
+                radar.InvalidJSONResponse,
+                r"invalid, incomplete, or unusable JSON after 3 attempts .*JSONDecodeError",
+            ):
+                radar.request_json("https://api.example/works", retries=3)
+
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual([call.args[2] for call in request.call_args_list], [45, 45, 45])
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
+    def test_request_json_retries_a_socket_timeout_on_python_39(self):
+        complete = b'{"results":[],"meta":{"next_cursor":null}}'
+        with mock.patch.object(
+            radar,
+            "_request_once",
+            side_effect=[radar.socket.timeout("read timed out"), (complete, {})],
+        ) as request, mock.patch.object(radar.time, "sleep") as sleep:
+            payload, _ = radar.request_json("https://api.example/works", retries=3)
+
+        self.assertEqual(payload["results"], [])
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_request_bytes_retries_a_socket_timeout_on_python_39(self):
+        with mock.patch.object(
+            radar,
+            "_request_once",
+            side_effect=[radar.socket.timeout("read timed out"), (b"complete", {})],
+        ) as request, mock.patch.object(radar.time, "sleep") as sleep:
+            data, _ = radar.request_bytes("https://api.example/data", retries=3)
+
+        self.assertEqual(data, b"complete")
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_request_bytes_retries_a_short_content_length(self):
+        def response(body, headers):
+            value = mock.MagicMock()
+            value.headers = headers
+            value.read.return_value = body
+            value.__enter__.return_value = value
+            value.__exit__.return_value = False
+            return value
+
+        short = response(b'{"cut":', {"Content-Length": "100"})
+        complete = response(b'{"ok":true}', {"Content-Length": "11"})
+        with mock.patch.object(
+            radar.urllib.request,
+            "urlopen",
+            side_effect=[short, complete],
+        ) as urlopen, mock.patch.object(radar.time, "sleep") as sleep:
+            data, _ = radar.request_bytes("https://api.example/data", retries=2)
+
+        self.assertEqual(data, b'{"ok":true}')
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_request_bytes_does_not_sleep_after_final_retryable_http_error(self):
+        errors = [
+            radar.urllib.error.HTTPError(
+                "https://api.example/data", 503, "unavailable", {}, None
+            )
+            for _ in range(2)
+        ]
+        with mock.patch.object(
+            radar.urllib.request,
+            "urlopen",
+            side_effect=errors,
+        ) as urlopen, mock.patch.object(radar.time, "sleep") as sleep:
+            with self.assertRaises(radar.urllib.error.HTTPError):
+                radar.request_bytes("https://api.example/data", retries=2)
+
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_request_bytes_aborts_a_long_rate_limit_without_sleeping(self):
+        error = radar.urllib.error.HTTPError(
+            "https://api.openalex.org/works",
+            429,
+            "rate limited",
+            {"Retry-After": "3600"},
+            None,
+        )
+        with mock.patch.object(
+            radar.urllib.request,
+            "urlopen",
+            side_effect=error,
+        ) as urlopen, mock.patch.object(radar.time, "sleep") as sleep:
+            with self.assertRaisesRegex(
+                RuntimeError, r"rate limited; retry after about 1h"
+            ):
+                radar.request_bytes("https://api.openalex.org/works", retries=5)
+
+        self.assertEqual(urlopen.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_long_rate_limit_uses_an_accurate_provider_neutral_duration(self):
+        error = radar.urllib.error.HTTPError(
+            "https://api.example/data",
+            429,
+            "rate limited",
+            {"Retry-After": "120"},
+            None,
+        )
+        with self.assertRaisesRegex(
+            RuntimeError, r"rate limited; retry after about 2m"
+        ):
+            radar._http_retry_delay(error, 0)
+
+    def test_openalex_retries_valid_json_with_an_invalid_schema(self):
+        source = {
+            "id": "openalex_ssd",
+            "endpoint": "https://api.openalex.org/works",
+            "queries": [{"search": "solid state drive"}],
+            "incremental_overlap_days": 365,
+        }
+        with mock.patch.object(
+            radar,
+            "_request_once",
+            side_effect=[
+                (b'{"error":"temporary upstream response"}', {}),
+                (b'{"results":[],"meta":{"count":0,"next_cursor":null}}', {}),
+            ],
+        ) as request, mock.patch.object(radar.time, "sleep") as sleep:
+            self.assertEqual(radar.fetch_openalex(source, False, None), [])
+
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_openalex_retries_missing_and_empty_cursor_metadata(self):
+        source = {
+            "id": "openalex_ssd",
+            "endpoint": "https://api.openalex.org/works",
+            "queries": [{"search": "solid state drive"}],
+            "incremental_overlap_days": 365,
+        }
+        with mock.patch.object(
+            radar,
+            "_request_once",
+            side_effect=[
+                (b'{"results":[],"meta":{}}', {}),
+                (b'{"results":[],"meta":{"next_cursor":""}}', {}),
+                (b'{"results":[],"meta":{"count":0,"next_cursor":null}}', {}),
+            ],
+        ) as request, mock.patch.object(radar.time, "sleep") as sleep:
+            self.assertEqual(radar.fetch_openalex(source, False, None), [])
+
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
+    def test_openalex_retries_empty_pages_with_a_continuation_cursor(self):
+        source = {
+            "id": "openalex_ssd",
+            "endpoint": "https://api.openalex.org/works",
+            "queries": [{"search": "solid state drive"}],
+            "incremental_overlap_days": 365,
+        }
+        responses = [
+            ({"results": [], "meta": {"count": 1, "next_cursor": "more"}}, {}),
+            ({"results": [], "meta": {"count": 0, "next_cursor": None}}, {}),
+        ]
+        with mock.patch.object(
+            radar,
+            "_request_once",
+            side_effect=[(json.dumps(body).encode(), headers) for body, headers in responses],
+        ) as request, mock.patch.object(radar.time, "sleep") as sleep:
+            self.assertEqual(radar.fetch_openalex(source, False, None), [])
+
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
+
+    def test_openalex_retries_missing_id_and_invalid_nested_work_shape(self):
+        source = {
+            "id": "openalex_ssd",
+            "endpoint": "https://api.openalex.org/works",
+            "queries": [{"search": "solid state drive"}],
+            "incremental_overlap_days": 365,
+        }
+        missing_id = {
+            "title": "SSD reliability",
+            "authorships": [],
+        }
+        invalid_authorships = {
+            "id": "https://openalex.org/W1",
+            "title": "SSD reliability",
+            "authorships": "not-an-array",
+        }
+        responses = [
+            ({"results": [missing_id], "meta": {"count": 1, "next_cursor": "more"}}, {}),
+            ({"results": [invalid_authorships], "meta": {"count": 1, "next_cursor": "more"}}, {}),
+            ({"results": [], "meta": {"count": 0, "next_cursor": None}}, {}),
+        ]
+        with mock.patch.object(
+            radar,
+            "_request_once",
+            side_effect=[(json.dumps(body).encode(), headers) for body, headers in responses],
+        ) as request, mock.patch.object(radar.time, "sleep") as sleep:
+            self.assertEqual(radar.fetch_openalex(source, False, None), [])
+
+        self.assertEqual(request.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2])
+
+    def test_openalex_accepts_a_stable_id_with_nullable_optional_fields(self):
+        radar.validate_openalex_payload(
+            {
+                "results": [
+                    {
+                        "id": "https://openalex.org/W1",
+                        "doi": None,
+                        "title": None,
+                        "publication_date": None,
+                        "type": None,
+                        "authorships": None,
+                        "primary_location": None,
+                        "best_oa_location": None,
+                        "abstract_inverted_index": None,
+                    }
+                ],
+                "meta": {"count": 1, "next_cursor": "more"},
+            }
+        )
+
+    def test_openalex_stops_after_the_schema_retry_budget(self):
+        source = {
+            "id": "openalex_ssd",
+            "endpoint": "https://api.openalex.org/works",
+            "queries": [{"search": "solid state drive"}],
+            "incremental_overlap_days": 365,
+        }
+        invalid = b'{"error":"temporary upstream response"}'
+        with mock.patch.object(
+            radar,
+            "_request_once",
+            return_value=(invalid, {}),
+        ) as request, mock.patch.object(radar.time, "sleep") as sleep:
+            with self.assertRaisesRegex(
+                radar.InvalidJSONResponse,
+                r"invalid, incomplete, or unusable JSON after 5 attempts",
+            ):
+                radar.fetch_openalex(source, False, None)
+
+        self.assertEqual(request.call_count, 5)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [1, 2, 4, 8])
+
+    def test_openalex_rejects_a_repeated_cursor_without_partial_success(self):
+        source = {
+            "id": "openalex_ssd",
+            "endpoint": "https://api.openalex.org/works",
+            "queries": [{"search": "solid state drive"}],
+            "incremental_overlap_days": 365,
+        }
+        payload = {
+            "results": [
+                {
+                    "id": "https://openalex.org/W1",
+                    "title": "SSD",
+                    "type": "article",
+                    "authorships": [],
+                    "primary_location": {},
+                }
+            ],
+            "meta": {"count": 1, "next_cursor": "*"},
+        }
+        with mock.patch.object(
+            radar, "request_json", return_value=(payload, {})
+        ) as request, mock.patch.object(radar.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "repeated cursor"):
+                radar.fetch_openalex(source, False, None)
+
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
+        query = parse_qs(urlsplit(request.call_args.args[0]).query)
+        self.assertEqual(query["per-page"], ["50"])
+
+    def test_openalex_restarts_a_query_when_the_final_count_is_incomplete(self):
+        source = {
+            "id": "openalex_ssd",
+            "endpoint": "https://api.openalex.org/works",
+            "queries": [{"search": "solid state drive"}],
+            "incremental_overlap_days": 365,
+        }
+        partial = {
+            "results": [
+                {
+                    "id": "https://openalex.org/W1",
+                    "title": "SSD reliability",
+                    "type": "article",
+                    "authorships": [],
+                    "primary_location": {},
+                }
+            ],
+            "meta": {"count": 2, "next_cursor": None},
+        }
+        complete_empty = {
+            "results": [],
+            "meta": {"count": 0, "next_cursor": None},
+        }
+        with mock.patch.object(
+            radar,
+            "request_json",
+            side_effect=[(partial, {}), (complete_empty, {})],
+        ) as request, mock.patch.object(radar.time, "sleep") as sleep:
+            self.assertEqual(radar.fetch_openalex(source, False, None), [])
+
+        self.assertEqual(request.call_count, 2)
+        sleep.assert_called_once_with(1)
+        self.assertEqual(
+            request.call_args_list[1].kwargs["headers"],
+            {"Cache-Control": "no-cache"},
+        )
+
+    def test_openalex_rejects_a_deterministically_oversized_query_immediately(self):
+        source = {
+            "id": "openalex_ssd",
+            "endpoint": "https://api.openalex.org/works",
+            "queries": [{"search": "solid state drive"}],
+            "incremental_overlap_days": 365,
+            "openalex_per_page": 50,
+            "openalex_max_pages": 2,
+        }
+        first_page = {
+            "results": [
+                {
+                    "id": "https://openalex.org/W1",
+                    "title": "SSD reliability",
+                    "type": "article",
+                    "authorships": [],
+                    "primary_location": {},
+                }
+            ],
+            "meta": {"count": 101, "next_cursor": "page-2"},
+        }
+        with mock.patch.object(
+            radar,
+            "request_json",
+            return_value=(first_page, {}),
+        ) as request, mock.patch.object(radar.time, "sleep") as sleep:
+            with self.assertRaisesRegex(
+                radar.OpenAlexPageLimitExceeded,
+                r"101 results.*100-result safety bound",
+            ):
+                radar.fetch_openalex(source, False, None)
+
+        self.assertEqual(request.call_count, 1)
+        sleep.assert_not_called()
+
+    def test_openalex_second_page_failure_never_ingests_a_partial_snapshot(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(radar.SCHEMA)
+        source = {
+            "id": "openalex_ssd",
+            "name": "OpenAlex",
+            "kind": "openalex",
+            "category": "paper",
+            "homepage": "https://openalex.org/",
+            "endpoint": "https://api.openalex.org/works",
+            "queries": [{"search": "solid state drive"}],
+            "incremental_overlap_days": 365,
+            "enabled": True,
+        }
+        radar.register_sources(conn, {"sources": [source]})
+        last_success = "2026-07-20T00:00:00Z"
+        conn.execute(
+            "UPDATE sources SET initialized=1,last_success_at=?,last_full_at=? WHERE id=?",
+            (last_success, last_success, source["id"]),
+        )
+        run_id = conn.execute(
+            "INSERT INTO runs(started_at,status) VALUES('now','running')"
+        ).lastrowid
+        first_page = {
+            "results": [
+                {
+                    "id": "https://openalex.org/W1",
+                    "title": "SSD reliability",
+                    "type": "article",
+                    "authorships": [],
+                    "primary_location": {},
+                }
+            ],
+            "meta": {"count": 2, "next_cursor": "page-2"},
+        }
+        page_error = radar.InvalidJSONResponse("page 2 remained incomplete")
+
+        with mock.patch.object(
+            radar,
+            "request_json",
+            side_effect=[(first_page, {}), page_error],
+        ):
+            with self.assertRaises(radar.InvalidJSONResponse):
+                radar.sync_source(conn, run_id, source, False)
+
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM items").fetchone()[0], 0)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM item_sources").fetchone()[0], 0
+        )
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) FROM run_events").fetchone()[0], 0
+        )
+        radar.record_source_failure(conn, source["id"], page_error)
+        state = conn.execute(
+            "SELECT last_success_at,last_error,failure_count FROM sources WHERE id=?",
+            (source["id"],),
+        ).fetchone()
+        self.assertEqual(state["last_success_at"], last_success)
+        self.assertIn("page 2 remained incomplete", state["last_error"])
+        self.assertEqual(state["failure_count"], 1)
+        conn.close()
+
     def test_rss_parsing(self):
         source = {"id": "ocp_storage", "name": "OCP Storage"}
         feed = b"""<?xml version='1.0'?><rss version='2.0'><channel>
@@ -171,6 +608,44 @@ class RadarUnitTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["initialized"], 1)
         self.assertIsNone(row["last_success_at"])
+        conn.close()
+
+    def test_recent_failure_is_retried_instead_of_being_cleared_by_freshness_skip(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(radar.SCHEMA)
+        source = {
+            "id": "academic_source",
+            "name": "Academic source",
+            "kind": "rss",
+            "category": "paper",
+            "homepage": "https://example.com/",
+            "endpoint": "https://example.com/feed.xml",
+            "minimum_interval_hours": 24,
+            "enabled": True,
+        }
+        radar.register_sources(conn, {"sources": [source]})
+        recent = radar.iso(radar.utcnow() - radar.dt.timedelta(minutes=5))
+        conn.execute(
+            "UPDATE sources SET initialized=1,last_success_at=?,last_attempt_at=?,"
+            "last_error='timeout',failure_count=1 WHERE id=?",
+            (recent, recent, source["id"]),
+        )
+        run_id = conn.execute(
+            "INSERT INTO runs(started_at,status) VALUES('now','running')"
+        ).lastrowid
+        fetcher = mock.Mock(return_value=[])
+
+        with mock.patch.dict(radar.FETCHERS, {"rss": fetcher}):
+            result = radar.sync_source(conn, run_id, source, False)
+
+        fetcher.assert_called_once()
+        self.assertNotIn("skipped", result)
+        state = conn.execute(
+            "SELECT last_error,failure_count FROM sources WHERE id=?", (source["id"],)
+        ).fetchone()
+        self.assertIsNone(state["last_error"])
+        self.assertEqual(state["failure_count"], 0)
         conn.close()
 
     def test_fetch_configuration_can_rebaseline_a_source_without_notification_flood(self):
@@ -501,6 +976,8 @@ class RadarUnitTests(unittest.TestCase):
         second_run = conn.execute("INSERT INTO runs(started_at,status) VALUES('two','running')").lastrowid
         payload = radar.report_payload(conn, second_run, [])
         self.assertEqual(payload["new_count"], 1)
+        self.assertEqual(payload["run_detected_new_count"], 0)
+        self.assertEqual(payload["run_detected_updated_count"], 0)
         self.assertEqual(payload["total_item_count"], 1)
         self.assertEqual(payload["professional_brief_count"], 1)
         self.assertEqual(payload["pending_history_brief_count"], 0)
@@ -508,6 +985,49 @@ class RadarUnitTests(unittest.TestCase):
         self.assertEqual(payload["backfill_percent"], 100.0)
         conn.execute("UPDATE run_events SET delivered_at='now' WHERE delivered_at IS NULL")
         self.assertEqual(radar.report_payload(conn, second_run, [])["new_count"], 0)
+
+    def test_candidate_detection_is_distinct_from_deliverable_professional_events(self):
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(radar.SCHEMA)
+        source = {
+            "id": "academic_source",
+            "name": "Academic source",
+            "kind": "rss",
+            "category": "paper",
+            "homepage": "https://example.com/",
+            "endpoint": "https://example.com/feed.xml",
+            "enabled": True,
+        }
+        radar.register_sources(conn, {"sources": [source]})
+        conn.execute(
+            "UPDATE sources SET initialized=1,last_success_at='2026-07-20T00:00:00Z' "
+            "WHERE id=?",
+            (source["id"],),
+        )
+        run_id = conn.execute(
+            "INSERT INTO runs(started_at,status) VALUES('now','running')"
+        ).lastrowid
+        record = {
+            "external_id": "paper-1",
+            "item_type": "paper",
+            "title": "A new NAND SSD reliability paper",
+            "url": "https://example.com/paper-1",
+            "doi": "10.1234/new-paper",
+            "authors": "A. Author",
+            "venue": "FAST",
+            "published_at": "2026-07-21",
+            "summary": "NAND flash retention and garbage collection.",
+        }
+        with mock.patch.dict(radar.FETCHERS, {"rss": mock.Mock(return_value=[record])}):
+            result = radar.sync_source(conn, run_id, source, False)
+        radar.briefs.ensure_fallback_briefs(conn)
+        payload = radar.report_payload(conn, run_id, [result])
+
+        self.assertEqual(payload["run_detected_new_count"], 1)
+        self.assertEqual(payload["new_count"], 0)
+        self.assertEqual(payload["awaiting_brief_count"], 1)
+        conn.close()
 
     def test_retention_hides_old_history_without_losing_current_old_item_update(self):
         conn = sqlite3.connect(":memory:")
@@ -657,6 +1177,8 @@ class RadarUnitTests(unittest.TestCase):
         self.assertEqual(payload["source_failure_count"], 0)
         self.assertFalse(payload["brief_generation_ok"])
         self.assertEqual(payload["brief_generation_failure_count"], 2)
+        self.assertEqual(payload["source_failures"], [])
+        self.assertEqual(len(payload["brief_failures"]), 1)
         self.assertEqual(len(payload["failures"]), 1)
         conn.close()
 
@@ -672,6 +1194,23 @@ class RadarUnitTests(unittest.TestCase):
             conn,
             run_id,
             [
+                {
+                    "id": "fast_dblp",
+                    "name": "FAST",
+                    "ok": True,
+                    "fetched": 10,
+                    "new": 2,
+                    "updated": 1,
+                },
+                {
+                    "id": "nvmw_official",
+                    "name": "NVMW",
+                    "ok": True,
+                    "skipped": True,
+                    "fetched": 0,
+                    "new": 0,
+                    "updated": 0,
+                },
                 {
                     "id": "openalex_ssd",
                     "name": "OpenAlex",
@@ -690,9 +1229,21 @@ class RadarUnitTests(unittest.TestCase):
             ],
         )
         self.assertFalse(payload["ok"])
+        self.assertEqual(payload["source_evaluated_count"], 3)
+        self.assertEqual(payload["source_attempted_count"], 2)
+        self.assertEqual(payload["source_success_count"], 1)
+        self.assertEqual(payload["source_skipped_count"], 1)
         self.assertEqual(payload["source_failure_count"], 1)
+        self.assertEqual(payload["run_detected_new_count"], 2)
+        self.assertEqual(payload["run_detected_updated_count"], 1)
+        self.assertEqual(
+            [check["status"] for check in payload["source_checks"]],
+            ["success", "fresh_cached", "failed"],
+        )
+        self.assertEqual(len(payload["source_failures"]), 1)
         self.assertFalse(payload["brief_generation_ok"])
         self.assertEqual(payload["brief_generation_failure_count"], 3)
+        self.assertEqual(len(payload["brief_failures"]), 1)
         self.assertEqual(len(payload["failures"]), 2)
         conn.close()
 

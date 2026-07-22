@@ -20,7 +20,9 @@ import json
 import os
 import re
 import shutil
+import socket
 import sqlite3
+import ssl
 import sys
 import tempfile
 import time
@@ -33,7 +35,7 @@ import xml.etree.ElementTree as ET
 from html.parser import HTMLParser
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 import briefs
 import item_page
@@ -54,6 +56,22 @@ ARCHIVE_BUCKET_COUNT = 32
 LOCAL_BASE_URL = "http://127.0.0.1:8765/"
 UTC = dt.timezone.utc
 BRIEF_GENERATION_FAILURE_ID = "brief_generation"
+
+
+class InvalidJSONResponse(ValueError):
+    """A JSON endpoint returned bytes that could not form one complete document."""
+
+
+class RetryableJSONPayloadError(ValueError):
+    """A JSON document was syntactically valid but not a usable API response."""
+
+
+class IncompleteOpenAlexSnapshot(RuntimeError):
+    """A complete JSON page violated an invariant across cursor pages."""
+
+
+class OpenAlexPageLimitExceeded(RuntimeError):
+    """A query is deterministically larger than this radar's safety bound."""
 
 
 SCHEMA = """
@@ -504,6 +522,73 @@ def register_sources(conn: sqlite3.Connection, config: Dict[str, Any]) -> None:
     conn.commit()
 
 
+RETRYABLE_HTTP_CODES = {408, 425, 429}
+TRANSIENT_REQUEST_ERRORS = (
+    urllib.error.URLError,
+    TimeoutError,
+    socket.timeout,
+    ConnectionError,
+    http.client.IncompleteRead,
+    http.client.BadStatusLine,
+    ssl.SSLEOFError,
+)
+DBLP_REQUEST_ERRORS = TRANSIENT_REQUEST_ERRORS + (ET.ParseError,)
+WEBSUB_REQUEST_ERRORS = TRANSIENT_REQUEST_ERRORS + (RuntimeError,)
+
+
+def _retry_after_seconds(headers: Any) -> Optional[float]:
+    raw = str(headers.get("Retry-After") or "").strip() if headers else ""
+    if not raw:
+        return None
+    if raw.isdigit():
+        return max(0.0, float(raw))
+    try:
+        target = email.utils.parsedate_to_datetime(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=UTC)
+    return max(0.0, (target.astimezone(UTC) - utcnow()).total_seconds())
+
+
+def _http_retry_delay(exc: urllib.error.HTTPError, attempt: int) -> float:
+    if exc.code not in RETRYABLE_HTTP_CODES and not 500 <= exc.code < 600:
+        raise exc
+    retry_after = _retry_after_seconds(exc.headers)
+    # A long server-directed pause does not belong inside a scheduled job.
+    # Preserve a precise, provider-neutral error and retry on the next run.
+    if exc.code == 429 and retry_after is not None and retry_after > 60:
+        minutes = max(1, int((retry_after + 59) // 60))
+        if minutes < 60:
+            wait_text = f"{minutes}m"
+        else:
+            wait_text = f"{max(1, int((minutes + 59) // 60))}h"
+        raise RuntimeError(f"rate limited; retry after about {wait_text}") from exc
+    return min(retry_after if retry_after is not None else 2**attempt, 20)
+
+
+def _request_once(
+    url: str,
+    headers: Dict[str, str],
+    timeout: int,
+) -> Tuple[bytes, Any]:
+    request = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        length_text = response.headers.get("Content-Length")
+        try:
+            expected_length = int(length_text) if length_text else None
+        except (TypeError, ValueError):
+            expected_length = None
+        if expected_length is not None and expected_length > MAX_RESPONSE_BYTES:
+            raise ValueError(f"response too large: {expected_length} bytes")
+        data = response.read(MAX_RESPONSE_BYTES + 1)
+        if len(data) > MAX_RESPONSE_BYTES:
+            raise ValueError("response exceeded size limit")
+        if expected_length is not None and len(data) < expected_length:
+            raise http.client.IncompleteRead(data, expected_length - len(data))
+        return data, response.headers
+
+
 def request_bytes(
     url: str,
     headers: Optional[Dict[str, str]] = None,
@@ -513,49 +598,70 @@ def request_bytes(
     request_headers = {"User-Agent": USER_AGENT, "Accept": "*/*"}
     if headers:
         request_headers.update(headers)
+    attempts = max(1, int(retries))
     last_error: Optional[BaseException] = None
-    for attempt in range(retries):
+    for attempt in range(attempts):
         try:
-            request = urllib.request.Request(url, headers=request_headers)
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                length = response.headers.get("Content-Length")
-                if length and int(length) > MAX_RESPONSE_BYTES:
-                    raise ValueError(f"response too large: {length} bytes")
-                data = response.read(MAX_RESPONSE_BYTES + 1)
-                if len(data) > MAX_RESPONSE_BYTES:
-                    raise ValueError("response exceeded size limit")
-                return data, response.headers
+            return _request_once(url, request_headers, timeout)
         except urllib.error.HTTPError as exc:
             last_error = exc
-            if exc.code == 429 or 500 <= exc.code < 600:
-                retry_after = exc.headers.get("Retry-After") if exc.headers else None
-                # A long Retry-After from OpenAlex means the daily budget is
-                # exhausted.  Sleeping for hours inside a desktop automation
-                # is harmful; record the source failure and retry next run.
-                if exc.code == 429 and retry_after and retry_after.isdigit() and int(retry_after) > 60:
-                    hours = max(1, round(int(retry_after) / 3600))
-                    raise RuntimeError(f"daily API budget exhausted; retry in about {hours}h") from exc
-                delay = float(retry_after) if retry_after and retry_after.isdigit() else 2 ** attempt
-                time.sleep(min(delay, 20))
-                continue
-            raise
-        except (urllib.error.URLError, TimeoutError, ConnectionError, http.client.IncompleteRead) as exc:
+            delay = _http_retry_delay(exc, attempt)
+        except TRANSIENT_REQUEST_ERRORS as exc:
             last_error = exc
-            if attempt + 1 < retries:
-                time.sleep(2 ** attempt)
-                continue
-            raise
+            delay = min(2**attempt, 20)
+        if attempt + 1 < attempts:
+            time.sleep(delay)
     if last_error:
         raise last_error
     raise RuntimeError("request failed")
 
 
-def request_json(url: str, retries: int = 3, headers: Optional[Dict[str, str]] = None) -> Tuple[Any, Any]:
-    request_headers = {"Accept": "application/json"}
+def request_json(
+    url: str,
+    retries: int = 3,
+    headers: Optional[Dict[str, str]] = None,
+    validator: Optional[Callable[[Any], None]] = None,
+    timeout: int = 45,
+) -> Tuple[Any, Any]:
+    request_headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
     if headers:
         request_headers.update(headers)
-    data, response_headers = request_bytes(url, request_headers, retries=retries)
-    return json.loads(data.decode("utf-8")), response_headers
+    attempts = max(1, int(retries))
+    last_error: Optional[BaseException] = None
+    last_size = 0
+    for attempt in range(attempts):
+        attempt_headers = dict(request_headers)
+        if attempt:
+            # Do not let a proxy cache replay the same malformed body.
+            attempt_headers["Cache-Control"] = "no-cache"
+        try:
+            data, response_headers = _request_once(url, attempt_headers, timeout)
+            last_size = len(data)
+            payload = json.loads(data)
+            if validator:
+                validator(payload)
+            return payload, response_headers
+        except urllib.error.HTTPError as exc:
+            last_error = exc
+            delay = _http_retry_delay(exc, attempt)
+        except TRANSIENT_REQUEST_ERRORS as exc:
+            last_error = exc
+            delay = min(2**attempt, 20)
+        except (UnicodeDecodeError, json.JSONDecodeError, RetryableJSONPayloadError) as exc:
+            last_error = exc
+            delay = min(2**attempt, 20)
+        if attempt + 1 < attempts:
+            time.sleep(delay)
+    if last_error and not isinstance(
+        last_error,
+        (UnicodeDecodeError, json.JSONDecodeError, RetryableJSONPayloadError),
+    ):
+        raise last_error
+    detail = f"{type(last_error).__name__}: {last_error}" if last_error else "unknown parse error"
+    raise InvalidJSONResponse(
+        f"invalid, incomplete, or unusable JSON after {attempts} attempts "
+        f"(last response {last_size} bytes): {detail}"
+    ) from last_error
 
 
 def author_names(value: Any) -> str:
@@ -612,7 +718,7 @@ def request_dblp_xml(source: Dict[str, Any], path: str) -> ET.Element:
             if exc.code == 429:
                 raise
             failures.append(f"{urllib.parse.urlsplit(url).netloc}: HTTP {exc.code}")
-        except (urllib.error.URLError, TimeoutError, ConnectionError, ET.ParseError) as exc:
+        except DBLP_REQUEST_ERRORS as exc:
             failures.append(f"{urllib.parse.urlsplit(url).netloc}: {type(exc).__name__}")
     raise RuntimeError(f"all official dblp mirrors failed for {path}: {'; '.join(failures)}")
 
@@ -1146,43 +1252,225 @@ def openalex_record(work: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def validate_openalex_payload(payload: Any) -> None:
+    """Reject syntactically valid error envelopes and incomplete page shapes."""
+
+    if not isinstance(payload, dict):
+        raise RetryableJSONPayloadError("OpenAlex response must be a JSON object")
+    results = payload.get("results")
+    meta = payload.get("meta")
+    if not isinstance(results, list) or not isinstance(meta, dict):
+        raise RetryableJSONPayloadError(
+            "OpenAlex response is missing valid results/meta fields"
+        )
+    if any(not isinstance(work, dict) for work in results):
+        raise RetryableJSONPayloadError(
+            "OpenAlex results contain a non-object work record"
+        )
+    for work in results:
+        work_id = work.get("id")
+        if not isinstance(work_id, str) or not work_id.strip():
+            raise RetryableJSONPayloadError(
+                "OpenAlex work is missing a stable non-empty id"
+            )
+        for field in ("doi", "title", "publication_date", "type"):
+            value = work.get(field)
+            if value is not None and not isinstance(value, str):
+                raise RetryableJSONPayloadError(
+                    f"OpenAlex work field {field} has an invalid type"
+                )
+        authorships = work.get("authorships")
+        if authorships is not None and not isinstance(authorships, list):
+            raise RetryableJSONPayloadError(
+                "OpenAlex work authorships must be an array or null"
+            )
+        for authorship in authorships or []:
+            if not isinstance(authorship, dict):
+                raise RetryableJSONPayloadError(
+                    "OpenAlex authorship must be an object"
+                )
+            author = authorship.get("author")
+            if author is not None and not isinstance(author, dict):
+                raise RetryableJSONPayloadError(
+                    "OpenAlex authorship author must be an object or null"
+                )
+            display_name = (author or {}).get("display_name")
+            if display_name is not None and not isinstance(display_name, str):
+                raise RetryableJSONPayloadError(
+                    "OpenAlex author display_name must be a string or null"
+                )
+        for field in ("primary_location", "best_oa_location"):
+            location = work.get(field)
+            if location is not None and not isinstance(location, dict):
+                raise RetryableJSONPayloadError(
+                    f"OpenAlex work field {field} must be an object or null"
+                )
+            landing_page = (location or {}).get("landing_page_url")
+            if landing_page is not None and not isinstance(landing_page, str):
+                raise RetryableJSONPayloadError(
+                    f"OpenAlex {field} landing_page_url must be a string or null"
+                )
+        primary = work.get("primary_location") or {}
+        primary_source = primary.get("source")
+        if primary_source is not None and not isinstance(primary_source, dict):
+            raise RetryableJSONPayloadError(
+                "OpenAlex primary_location source must be an object or null"
+            )
+        source_name = (primary_source or {}).get("display_name")
+        if source_name is not None and not isinstance(source_name, str):
+            raise RetryableJSONPayloadError(
+                "OpenAlex source display_name must be a string or null"
+            )
+        inverted = work.get("abstract_inverted_index")
+        if inverted is not None and not isinstance(inverted, dict):
+            raise RetryableJSONPayloadError(
+                "OpenAlex abstract_inverted_index must be an object or null"
+            )
+        for positions in (inverted or {}).values():
+            if not isinstance(positions, list) or any(
+                not isinstance(index, int) or isinstance(index, bool)
+                for index in positions
+            ):
+                raise RetryableJSONPayloadError(
+                    "OpenAlex abstract positions must be arrays of integers"
+                )
+    if "next_cursor" not in meta:
+        raise RetryableJSONPayloadError("OpenAlex meta is missing next_cursor")
+    next_cursor = meta["next_cursor"]
+    if next_cursor is not None and (
+        not isinstance(next_cursor, str) or not next_cursor.strip()
+    ):
+        raise RetryableJSONPayloadError(
+            "OpenAlex next_cursor must be a non-empty string or null"
+        )
+    count = meta.get("count")
+    if (
+        not isinstance(count, int)
+        or isinstance(count, bool)
+        or count < 0
+    ):
+        raise RetryableJSONPayloadError(
+            "OpenAlex meta count must be a non-negative integer"
+        )
+    # A continuation cursor paired with an empty page cannot make progress.
+    # A non-empty final page with a null cursor is valid in the live API; its
+    # completeness is checked against meta.count across the whole query.
+    if not results and next_cursor is not None:
+        raise RetryableJSONPayloadError(
+            "OpenAlex returned an empty page with a continuation cursor"
+        )
+
+
+def fetch_openalex_query(
+    source: Dict[str, Any],
+    query: Dict[str, Any],
+    start: str,
+    *,
+    bypass_cache: bool = False,
+) -> Dict[str, Dict[str, Any]]:
+    fields = "id,doi,title,publication_date,authorships,primary_location,best_oa_location,abstract_inverted_index,type"
+    page_size = min(100, max(1, int(source.get("openalex_per_page", 50))))
+    max_pages = min(200, max(1, int(source.get("openalex_max_pages", 100))))
+    cursor: Optional[str] = "*"
+    seen_cursors: set[str] = set()
+    seen_work_ids: set[str] = set()
+    expected_count: Optional[int] = None
+    received_count = 0
+    page_count = 0
+    unique: Dict[str, Dict[str, Any]] = {}
+    while cursor is not None:
+        if cursor in seen_cursors:
+            raise IncompleteOpenAlexSnapshot(
+                "OpenAlex returned a repeated cursor; snapshot is incomplete"
+            )
+        seen_cursors.add(cursor)
+        params = {
+            "search": query["search"],
+            "filter": f"from_publication_date:{start}",
+            # OpenAlex allows 100, but 50 keeps abstract-bearing responses well
+            # below the size at which the live endpoint timed out or truncated.
+            "per-page": page_size,
+            "cursor": cursor,
+            "select": fields,
+        }
+        api_key = os.environ.get("OPENALEX_API_KEY")
+        if api_key:
+            params["api_key"] = api_key
+        url = f"{source['endpoint']}?{urllib.parse.urlencode(params)}"
+        payload, _ = request_json(
+            url,
+            retries=5,
+            headers={"Cache-Control": "no-cache"} if bypass_cache else None,
+            validator=validate_openalex_payload,
+        )
+        results = payload["results"]
+        meta = payload["meta"]
+        page_total = int(meta["count"])
+        if expected_count is None:
+            expected_count = page_total
+            if expected_count > page_size * max_pages:
+                raise OpenAlexPageLimitExceeded(
+                    f"OpenAlex advertised {expected_count} results, exceeding the "
+                    f"configured {page_size * max_pages}-result safety bound"
+                )
+        elif page_total != expected_count:
+            raise IncompleteOpenAlexSnapshot(
+                "OpenAlex result count changed during cursor paging"
+            )
+        for work in results:
+            work_id = str(work["id"])
+            if work_id in seen_work_ids:
+                raise IncompleteOpenAlexSnapshot(
+                    "OpenAlex repeated a work across cursor pages"
+                )
+            seen_work_ids.add(work_id)
+            if work.get("type") in {
+                "dataset", "paratext", "reference-entry", "editorial", "letter"
+            }:
+                continue
+            record = openalex_record(work)
+            searchable = f"{record['title']} {record['summary']}"
+            if relevant_openalex(searchable, query):
+                unique[str(record["external_id"])] = record
+        received_count += len(results)
+        page_count += 1
+        next_cursor = meta["next_cursor"]
+        if next_cursor is None:
+            if received_count != expected_count:
+                raise IncompleteOpenAlexSnapshot(
+                    "OpenAlex cursor ended before the advertised result count"
+                )
+            break
+        if page_count >= max_pages:
+            raise IncompleteOpenAlexSnapshot(
+                "OpenAlex page limit reached before the cursor was exhausted"
+            )
+        cursor = next_cursor
+    return unique
+
+
 def fetch_openalex(source: Dict[str, Any], full: bool, since: Optional[str]) -> List[Dict[str, Any]]:
     start = since[:10] if since else "2000-01-01"
     if not full:
         overlap = int(source.get("incremental_overlap_days", 365))
         start = (utcnow() - dt.timedelta(days=overlap)).date().isoformat()
-    fields = "id,doi,title,publication_date,authorships,primary_location,best_oa_location,abstract_inverted_index,type"
     unique: Dict[str, Dict[str, Any]] = {}
     for query in source.get("queries", []):
-        cursor = "*"
-        page_count = 0
-        while cursor:
-            params = {
-                "search": query["search"],
-                "filter": f"from_publication_date:{start}",
-                # OpenAlex's current documented maximum is 100; keeping the
-                # abstract-bearing responses smaller also avoids read timeouts.
-                "per-page": 100,
-                "cursor": cursor,
-                "select": fields,
-            }
-            api_key = os.environ.get("OPENALEX_API_KEY")
-            if api_key:
-                params["api_key"] = api_key
-            url = f"{source['endpoint']}?{urllib.parse.urlencode(params)}"
-            payload, _ = request_json(url, retries=5)
-            results = payload.get("results") or []
-            for work in results:
-                if work.get("type") in {"dataset", "paratext", "reference-entry", "editorial", "letter"}:
-                    continue
-                record = openalex_record(work)
-                searchable = f"{record['title']} {record['summary']}"
-                if relevant_openalex(searchable, query):
-                    unique[str(record["external_id"])] = record
-            cursor = (payload.get("meta") or {}).get("next_cursor")
-            page_count += 1
-            if not results or page_count >= 100:
+        query_records: Dict[str, Dict[str, Any]] = {}
+        for snapshot_attempt in range(2):
+            try:
+                query_records = fetch_openalex_query(
+                    source,
+                    query,
+                    start,
+                    bypass_cache=bool(snapshot_attempt),
+                )
                 break
+            except IncompleteOpenAlexSnapshot:
+                if snapshot_attempt:
+                    raise
+                time.sleep(1)
+        unique.update(query_records)
     return list(unique.values())
 
 
@@ -1417,18 +1705,18 @@ def sync_source(conn: sqlite3.Connection, run_id: int, source: Dict[str, Any], f
             periodic_full = utcnow() - parsed_full >= dt.timedelta(days=30)
     full = force_full or not initialized or periodic_full
     minimum_interval = int(source.get("minimum_interval_hours", 0))
-    if not full and minimum_interval and row["last_success_at"]:
+    if (
+        not full
+        and minimum_interval
+        and row["last_success_at"]
+        and not row["last_error"]
+    ):
         last_success = dt.datetime.fromisoformat(row["last_success_at"].replace("Z", "+00:00"))
         age = utcnow() - last_success
         if age < dt.timedelta(hours=minimum_interval):
-            # Academic indexing does not need the twice-daily cadence used for
-            # RSS/WP sources.  A fresh successful snapshot is healthy even if
-            # a redundant manual retry later exhausted the anonymous budget.
-            conn.execute(
-                "UPDATE sources SET last_error=NULL,failure_count=0 WHERE id=?",
-                (source["id"],),
-            )
-            conn.commit()
+            # A genuinely fresh successful snapshot can be reused. A source
+            # with a newer failure never enters this branch: only a real
+            # upstream success is allowed to clear its health state.
             return {
                 "id": source["id"], "name": source["name"], "ok": True,
                 "baseline": False, "fetched": 0, "new": 0, "updated": 0,
@@ -2136,7 +2424,7 @@ def publish_websub(hub_url: str, topic_url: str, retries: int = 3) -> None:
                 if not 200 <= status < 300:
                     raise RuntimeError(f"WebSub hub returned HTTP {status}")
                 return
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, ConnectionError, RuntimeError) as exc:
+        except WEBSUB_REQUEST_ERRORS as exc:
             last_error = exc
             if attempt + 1 < retries:
                 time.sleep(2 ** attempt)
@@ -2266,6 +2554,40 @@ def report_payload(
     source_failures = [result for result in source_results if not result.get("ok")]
     brief_generation_failures = list(brief_failures or [])
     failures = [*source_failures, *brief_generation_failures]
+    skipped_sources = [result for result in source_results if result.get("skipped")]
+    attempted_sources = [result for result in source_results if not result.get("skipped")]
+    successful_sources = [result for result in attempted_sources if result.get("ok")]
+    run_detected_new_count = sum(
+        max(0, int(result.get("new", 0) or 0)) for result in successful_sources
+    )
+    run_detected_updated_count = sum(
+        max(0, int(result.get("updated", 0) or 0)) for result in successful_sources
+    )
+    source_checks = []
+    for result in source_results:
+        if not result.get("ok"):
+            status = "failed"
+        elif result.get("skipped"):
+            status = "fresh_cached"
+        elif result.get("baseline"):
+            status = "baseline"
+        else:
+            status = "success"
+        source_checks.append(
+            {
+                key: value
+                for key, value in {
+                    "id": result.get("id"),
+                    "name": result.get("name"),
+                    "status": status,
+                    "fetched": int(result.get("fetched", 0) or 0),
+                    "new": int(result.get("new", 0) or 0),
+                    "updated": int(result.get("updated", 0) or 0),
+                    "error": result.get("error"),
+                }.items()
+                if value not in (None, "")
+            }
+        )
     brief_generation_failure_count = sum(
         max(1, int(failure.get("failed_count", 1) or 1))
         for failure in brief_generation_failures
@@ -2340,9 +2662,18 @@ def report_payload(
         # signal, but it is not a source-ingestion or deployment failure and
         # therefore must not make an otherwise healthy Actions run fail.
         "ok": not source_failures,
+        "source_evaluated_count": len(source_results),
+        "source_attempted_count": len(attempted_sources),
+        "source_success_count": len(successful_sources),
+        "source_skipped_count": len(skipped_sources),
         "source_failure_count": len(source_failures),
+        "source_checks": source_checks,
+        "source_failures": source_failures,
         "brief_generation_ok": not brief_generation_failures,
         "brief_generation_failure_count": brief_generation_failure_count,
+        "brief_failures": brief_generation_failures,
+        "run_detected_new_count": run_detected_new_count,
+        "run_detected_updated_count": run_detected_updated_count,
         "initialized": [r["name"] for r in source_results if r.get("baseline") and r.get("ok")],
         "new_count": len(new_rows),
         "updated_count": len(updated_rows),
@@ -2368,6 +2699,8 @@ def markdown_report(payload: Dict[str, Any], max_items: int = 30) -> str:
         f"FAILURES={len(payload['failures'])} "
         f"SOURCE_FAILURES={payload.get('source_failure_count', len(payload['failures']))} "
         f"BRIEF_FAILURES={payload.get('brief_generation_failure_count', 0)} "
+        f"DETECTED_NEW={payload.get('run_detected_new_count', 0)} "
+        f"DETECTED_UPDATED={payload.get('run_detected_updated_count', 0)} "
         f"WARNINGS={len(payload.get('warnings', []))}",
         f"ARCHIVE={payload['archive_path']}",
     ]
