@@ -15,17 +15,21 @@ on:
       - tests/**
       - .github/workflows/publish-radar.yml
   schedule:
-    # Offset from the top of the hour because GitHub reports heavier queueing
-    # there. GitHub schedules are best-effort, not real-time guarantees.
-    - cron: "7,22,37,52 * * * *"
+    # Poll frequent sources hourly, offset from the top of the hour. Hours 03
+    # through 05 UTC are reserved for the daily academic scan and the monthly
+    # full rescan so a newer run cannot cancel legitimate long-running work.
+    - cron: "7 0-2,6-23 * * *"
     # Academic indexes are much slower and do not change minute by minute.
     - cron: "11 3 * * *"
     # Explicit full rescan covers delayed academic indexing once a month.
-    - cron: "23 4 1 * *"
+    - cron: "11 5 1 * *"
 
 concurrency:
   group: ssd-research-radar-production
-  cancel-in-progress: false
+  # A hosted-runner allocation can occasionally remain queued indefinitely.
+  # Let the next scheduled run replace it instead of blocking every later
+  # synchronization behind a stale run.
+  cancel-in-progress: true
 
 env:
   PUBLIC_BASE_URL: https://99cipyl.github.io/ssd-research-radar/
@@ -37,8 +41,11 @@ jobs:
       contents: write
       pages: write
       models: read
-    runs-on: ubuntu-latest
-    timeout-minutes: 55
+    # Use the separate GitHub-hosted ARM64 pool. All actions in this workflow
+    # are GitHub-maintained and support ARM64, while the synchronization code
+    # is architecture-independent Python.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 50
     env:
       OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
       GROUPS_IO_API_KEY: ${{ secrets.GROUPS_IO_API_KEY }}
@@ -101,7 +108,7 @@ jobs:
           elif [[ "$EVENT_SCHEDULE" == "11 3 * * *" ]]; then
             mode=academic
             full=false
-          elif [[ "$EVENT_SCHEDULE" == "23 4 1 * *" ]]; then
+          elif [[ "$EVENT_SCHEDULE" == "11 5 1 * *" ]]; then
             mode=monthly
             full=true
           else
@@ -245,7 +252,7 @@ jobs:
       contents: read
       pages: write
       id-token: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
@@ -270,7 +277,7 @@ jobs:
     if: always()
     permissions:
       contents: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04-arm
     steps:
       - name: Report source and deployment health
         env:
