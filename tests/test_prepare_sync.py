@@ -189,6 +189,18 @@ class PrepareSyncTests(unittest.TestCase):
         self.assertIn("report-health:", workflow)
         self.assertNotIn("report-partial-failure:", workflow)
 
+    def test_workflow_recovers_from_a_stale_hosted_runner_queue(self):
+        workflow = (ROOT / ".github/workflows/publish-radar.yml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('cron: "7 0-2,6-23 * * *"', workflow)
+        self.assertEqual(workflow.count('"11 5 1 * *"'), 2)
+        self.assertNotIn('"23 4 1 * *"', workflow)
+        self.assertNotIn('cron: "7,22,37,52 * * * *"', workflow)
+        self.assertIn("cancel-in-progress: true", workflow)
+        self.assertEqual(workflow.count("runs-on: ubuntu-24.04-arm"), 3)
+        self.assertNotIn("runs-on: ubuntu-latest", workflow)
+
     def test_report_health_shell_status_matrix(self):
         workflow = (ROOT / ".github/workflows/publish-radar.yml").read_text(
             encoding="utf-8"
