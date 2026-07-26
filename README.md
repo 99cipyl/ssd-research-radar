@@ -146,7 +146,7 @@ RSS 是首次基线后的“已完成专业整理的新增与实质更新事件�
 
 ## 自动通知
 
-公开仓库的 GitHub Actions 会约每 15 分钟检查 RSS、WordPress 和规范页；FAST 与 OpenAlex 每天检查一次，月初只对 FAST 做一次完整 TOC 回扫。OpenAlex 在首次基线以后采用最近一年的滚动重扫，不执行月度全历史回放。手动触发或相关同步代码 push 会作为受控修复运行，绕过最小轮询间隔检查全部启用来源，但仍不会触发 OpenAlex 全历史回放。另有本机 Codex Heartbeat 作为故障提醒与备用检查。
+公开仓库的 GitHub Actions 会约每小时检查 RSS、WordPress 和规范页；FAST 与 OpenAlex 每天检查一次，月初只对 FAST 做一次完整 TOC 回扫。每小时任务会替换仍未获得运行器或超时未完成的旧任务，避免一个异常队列永久阻塞后续更新；每日学术扫描和月度回扫有独立的时间窗口。OpenAlex 在首次基线以后采用最近一年的滚动重扫，不执行月度全历史回放。手动触发或相关同步代码 push 会作为受控修复运行，绕过最小轮询间隔检查全部启用来源，但仍不会触发 OpenAlex 全历史回放。另有本机 Codex Heartbeat 作为故障提醒与备用检查。
 
 自动检查读取 `reports/latest.json`：
 
